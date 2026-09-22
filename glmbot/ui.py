@@ -10,7 +10,18 @@ Design goals
 
 from __future__ import annotations
 
+import os
+import sys
 from typing import Any
+
+# --no-color must take effect at console CONSTRUCTION time: this Rich
+# version keeps emitting codes (bold, etc.) on post-hoc flips and even
+# with NO_COLOR set. So detect the flag at import and bind the plain
+# ASCII renderer instead - zero ANSI bytes, guaranteed.
+_PLAIN = "--no-color" in sys.argv
+if _PLAIN:
+    os.environ.setdefault("NO_COLOR", "1")
+    os.environ.setdefault("TERM", "dumb")
 
 try:
     from rich.console import Console as _RichConsole
@@ -117,7 +128,10 @@ class PlainPanel:
 
 
 # ---------------- public API (mirrors rich usage in the codebase) ----------
-if HAS_RICH:
+# NOTE: when _PLAIN, bind the pure-ASCII renderer even if rich is installed.
+# Rich keeps emitting codes (bold, etc.) despite no_color/NO_COLOR, so the
+# only guaranteed-clean path on legacy consoles is bypassing Rich entirely.
+if HAS_RICH and not _PLAIN:
     from rich import box as _box
 
     class _AsciiTable(_RichTable):
@@ -145,6 +159,12 @@ else:
     Panel = PlainPanel  # type: ignore[assignment]
     Progress = None  # type: ignore[assignment]
 
+
+def using_plain() -> bool:
+    """True when output bypasses Rich (flagged or minimal install)."""
+    return _PLAIN or not HAS_RICH
+
+
 _CONSOLE: Any | None = None
 
 
@@ -157,20 +177,19 @@ def console() -> Any:
 
 
 def set_no_color() -> None:
-    """Force plain output everywhere (old conhost can't render ANSI codes).
+    """Late switch to plain output (programmatic use).
 
-    Must work even though the shared console (and Rich log handler) may
-    already exist: flip the live instance and set the env for future ones.
+    The CLI path doesn't need this: _PLAIN is detected at import, so all
+    bindings (console/Table/Panel) are already the ASCII renderer. This
+    only affects consoles created via console() after the call.
     """
-    import contextlib
     import os
 
     os.environ["NO_COLOR"] = "1"
     os.environ["TERM"] = "dumb"
-    global _CONSOLE
-    if _CONSOLE is not None and hasattr(_CONSOLE, "no_color"):
-        with contextlib.suppress(Exception):
-            _CONSOLE.no_color = True
+    global _PLAIN, _CONSOLE
+    _PLAIN = True
+    _CONSOLE = PlainConsole()  # bypass Rich entirely: zero ANSI, guaranteed
 
 
 BANNER = r"""

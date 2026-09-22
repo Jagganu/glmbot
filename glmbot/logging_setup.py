@@ -63,23 +63,31 @@ def setup_logging(verbose: bool = False, log_file: str | None = None) -> logging
     fmt_plain = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
 
-    try:
-        from rich.logging import RichHandler
+    from .ui import using_plain
 
-        from .ui import console as _get_console
-
-        console = _get_console()
-        handler: logging.Handler = RichHandler(
-            console=console,
-            rich_tracebacks=True,
-            show_path=False,
-            markup=True,
-            log_time_format="[%H:%M:%S]",
-        )
-        handler.setFormatter(logging.Formatter("%(message)s", datefmt="%H:%M:%S"))
-    except Exception:
+    if using_plain():
+        # Legacy console or minimal install: no Rich at all (even RichHandler
+        # emits codes this Rich version won't suppress) - plain stdlib output.
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter(fmt_plain, datefmt=datefmt))
+    else:
+        try:
+            from rich.logging import RichHandler
+
+            from .ui import console as _get_console
+
+            console = _get_console()
+            handler = RichHandler(
+                console=console,
+                rich_tracebacks=True,
+                show_path=False,
+                markup=True,
+                log_time_format="[%H:%M:%S]",
+            )
+            handler.setFormatter(logging.Formatter("%(message)s", datefmt="%H:%M:%S"))
+        except Exception:
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter(fmt_plain, datefmt=datefmt))
 
     handler.addFilter(_RedactFilter())
     handler._glmbot = True  # type: ignore[attr-defined]
