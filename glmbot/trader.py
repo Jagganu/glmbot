@@ -197,6 +197,20 @@ class Trader:
                 log.warning("price fetch failed for %s: %s", s, e)
         return out
 
+    def position_value(self, pos: dict, price: float) -> float:
+        """Honest mark-to-market value of one open position.
+
+        Spot: full notional (qty x price) - cash paid it in full.
+        Futures: locked margin + unrealized PnL - only the margin left
+        the wallet, so counting full notional would double-count.
+        """
+        qty = float(pos["qty"])
+        entry = float(pos["entry_price"])
+        if self.cfg.market == "futures":
+            margin = qty * entry / max(1, self.cfg.leverage)
+            return margin + qty * (price - entry)
+        return qty * price
+
     # ---------------- main loop ----------------
     def run_once(self) -> dict[str, int]:
         """One full sense->decide->act cycle. Returns cycle counters (for tests/ops)."""
@@ -264,7 +278,7 @@ class Trader:
             log.error("balance fetch failed; snapshotting with last-known cash: %s", e)
             cash = 0.0
         pos_val = sum(
-            pos["qty"] * quotes.get(pos["symbol"], pos["entry_price"])
+            self.position_value(pos, quotes.get(pos["symbol"], pos["entry_price"]))
             for pos in self.store.open_positions(mode)
         )
         total = cash + pos_val

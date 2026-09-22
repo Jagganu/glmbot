@@ -277,7 +277,11 @@ class Backtester:
                 if len(buys) >= need and len(sells) == 0:
                     pending_entry = {"reason": buys[0].reason}
 
-            equity_curve.append(cash + qty * close)
+            if self.is_futures and qty > 0:
+                # margin + unrealized (same honest accounting as the live trader)
+                equity_curve.append(margin_locked + qty * (close - entry_price) + cash)
+            else:
+                equity_curve.append(cash + qty * close)
 
         # close residual at last close
         if qty > 0:
