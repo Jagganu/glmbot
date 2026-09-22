@@ -1,0 +1,86 @@
+# ================= GLMBOT CONFIG v1.1 =================
+# Copy to config.yml and edit. NEVER commit real keys (config.yml is gitignored).
+#
+# Quick start:
+#   1. cp config.example.yml config.yml
+#   2. paste api.key / api.secret (or export GLMBOT_API_KEY / GLMBOT_API_SECRET)
+#   3. py bot.py validate && py bot.py doctor
+#
+# Env interpolation: any value may use ${VAR} or ${VAR:-default}.
+# Example:  key: "${GLMBOT_API_KEY:-YOUR_BINANCE_API_KEY}"
+
+api:
+  key: "${GLMBOT_API_KEY:-YOUR_BINANCE_API_KEY}"
+  secret: "${GLMBOT_API_SECRET:-YOUR_BINANCE_API_SECRET}"
+  # true = Binance Testnet (spot testnet OR futures testnet, per trade_type).
+  # false = MAINNET (real money — triple-check mode + trade_type first).
+  testnet: true
+
+trading:
+  quote_asset: "USDT"          # all pairs trade vs this quote (symbols must end with it)
+  mode: "paper"                # paper | live  (paper = simulated fills, no keys needed)
+  trade_type: "spot"           # spot | futures (futures = USD-M, long-only, one-way mode)
+  leverage: 1                  # futures only: 1..20. Start at 1-2! (spot must be 1)
+  update_interval_sec: 60      # main loop interval, >= 5 (60 = one check per 15m candle slice)
+
+strategies:
+  # Available: ema_cross, rsi_reversion, macd, bollinger, supertrend, donchian_breakout
+  # Run `py bot.py strategies` for signal logic + parameters.
+  active: ["ema_cross", "rsi_reversion", "macd", "bollinger"]
+  ema_cross:
+    fast: 9
+    slow: 21                   # must be > fast
+  rsi_reversion:
+    period: 14
+    oversold: 30               # BUY when RSI recovers above this
+    overbought: 70             # SELL when RSI drops below this
+  macd:
+    fast: 12
+    slow: 26
+    signal: 9
+  bollinger:
+    period: 20
+    std_dev: 2.0
+  # supertrend:
+  #   period: 10
+  #   multiplier: 3.0
+  # donchian_breakout:
+  #   period: 20
+
+risk:
+  quote_budget: 1000.0         # total quote allocated to the bot (sizing anchor)
+  per_trade_pct: 2.0           # % of budget as margin/notional per position
+  max_open_positions: 3        # portfolio cap (1 per symbol in v1)
+  stop_loss_pct: 2.0           # fixed stop below entry. Futures: price move (x leverage on margin!)
+  take_profit_pct: 4.0         # fixed target above entry
+  trailing_stop_pct: 1.5       # ratchet distance (0 = disabled)
+  cooldown_min: 30             # min minutes between entries per symbol
+  # --- ATR stops (volatility-adaptive; override fixed % when enabled) ---
+  atr_stops: false
+  atr_period: 14
+  atr_sl_mult: 2.0             # SL = entry - 2*ATR
+  atr_tp_mult: 3.0             # TP = entry + 3*ATR
+  # --- daily kill switch (0 = disabled; 5 = halt new entries after -5% day) ---
+  daily_loss_cap_pct: 5.0
+  # --- consensus voting: 0 = ALL strategies must agree; N = at least N of M (SELL vetoes) ---
+  min_votes: 0
+  # --- opt-in guards (0 = disabled) ---
+  max_daily_trades: 0          # cap BUY fills per UTC day
+  max_symbol_positions: 1      # reserved (v1 = 1 position per symbol)
+  slippage_bps: 0.0            # backtest slippage in basis points (e.g. 5 = 0.05%)
+
+watchlist:
+  symbols: ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"]
+
+storage:
+  sqlite_path: "data/glm.db"  # single-file journal (copy phone<->PC to migrate)
+  klines_cache_dir: "data/cache"
+
+notifier:
+  telegram:
+    enabled: false
+    bot_token: "${TELEGRAM_BOT_TOKEN:-}"
+    chat_id: "${TELEGRAM_CHAT_ID:-}"
+  webhook:
+    enabled: false
+    url: "${GLMBOT_WEBHOOK_URL:-}"   # POSTs JSON {event, text, ts}

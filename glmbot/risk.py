@@ -1,0 +1,207 @@
+"""Position sizing, entry gating and exit management.
+
+Order of exit checks (first hit wins):
+  1. hard stop-loss -> 2. take-profit -> 3. trailing stop.
+
+Trailing stop *ratchets*: as price climbs, ``stop_loss`` is raised to
+``trail_high * (1 - trailing_pct)`` and persisted via ``Store.update_trail``.
+It never moves down.
+
+Entry gates (in order): max positions -> daily kill switch -> daily trade
+budget -> per-symbol cooldown.
+"""
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal
+from typing import Dict, Optional
+
+from .config import RiskCfg
+from .storage import Store
+
+log = logging.getLogger("glmbot.risk")
+
+MIN_NOTIONAL_QUOTE = 10.0  # Binance practical minimum; mirrors position_size floor
+
+
+@dataclass
+class ExitPlan:
+    action: str          # "exit" | "hold"
+    reason: str
+    trigger_price: Optional[float] = None
+
+    @property
+    def should_exit(self) -> bool:
+        return self.action == "exit"
+
+
+class RiskManager:
+    """Stateless-except-cooldowns risk engine backed by :class:`Store`."""
+
+    def __init__(self, cfg: RiskCfg, store: Store):
+        self.cfg = cfg
+        self.store = store
+        self._last_entry_ts: Dict[str, float] = {}
+
+    # ---------------- entries ----------------
+    def can_open(self, symbol: str, mode: str) -> tuple[bool, str]:
+        """Return (allowed, human-readable reason). Empty reason when allowed."""
+        open_pos = self.store.open_positions(mode)
+        if len(open_pos) >= self.cfg.max_open_positions:
+            return False, f"max_open_positions reached ({len(open_pos)}/{self.cfg.max_open_positions})"
+        if self.tripped_today(mode):
+            return False, "daily loss cap tripped - trading halted until tomorrow (UTC)"
+        if self.cfg.max_daily_trades > 0:
+            today = self._today_key()
+            n_today = self._count_entries_today(mode, today)
+            if n_today >= self.cfg.max_daily_trades:
+                return False, f"daily trade budget used ({n_today}/{self.cfg.max_daily_trades})"
+        last = self._last_entry_ts.get(symbol)
+        if last and time.time() - last < self.cfg.cooldown_min * 60:
+            wait = int(self.cfg.cooldown_min - (time.time() - last) / 60) + 1
+            return False, f"cooldown: {wait}m left for {symbol} ({self.cfg.cooldown_min}m)"
+        return True, ""
+
+    def _count_entries_today(self, mode: str, today: str) -> int:
+        try:
+            trades = self.store.trades(mode=mode, limit=1000)
+            return sum(
+                1 for t in trades
+                if t.get("side") == "BUY" and str(t.get("ts", ""))[:10] == today
+            )
+        except Exception:
+            return 0
+
+    # ---------------- daily loss cap (kill switch) ----------------
+    def _today_key(self) -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def tripped_today(self, mode: str) -> bool:
+        if self.cfg.daily_loss_cap_pct <= 0:
+            return False
+        return self.store.get_meta(f"killswitch:{mode}:{self._today_key()}") == "1"
+
+    def check_daily_loss(self, mode: str, current_total: float) -> bool:
+        """Trip the kill switch if drawdown vs today's first snapshot >= cap.
+
+        Returns True exactly when the switch *trips on this call*.
+        """
+        cap = self.cfg.daily_loss_cap_pct
+        if cap <= 0:
+            return False
+        baseline = self._day_baseline(mode)
+        if baseline is None or baseline <= 0:
+            return False
+        loss_pct = (1 - current_total / baseline) * 100
+        if loss_pct >= cap:
+            self.store.set_meta(f"killswitch:{mode}:{self._today_key()}", "1")
+            log.warning(
+                "DAILY LOSS CAP HIT: -%.2f%% (cap %.2f%%, baseline %.2f -> now %.2f) "
+                "- halting new entries until tomorrow (UTC)",
+                loss_pct, cap, baseline, current_total,
+            )
+            return True
+        return False
+
+    def _day_baseline(self, mode: str) -> Optional[float]:
+        """First equity snapshot of the current UTC day, else latest."""
+        rows = self.store.equity_history(mode, limit=500)
+        if not rows:
+            return None
+        today = self._today_key()
+        todays = [r for r in rows if str(r.get("ts") or "").startswith(today)]
+        if todays:
+            return float(todays[0]["total"])
+        return float(rows[-1]["total"])
+
+    # ---------------- sizing ----------------
+    def position_size(self, price: float, cash_available: float) -> float:
+        """Quote-currency amount to risk on the next entry (0 = skip).
+
+        Rule: ``min(budget * per_trade_pct, cash_available)``, floored at the
+        Binance practical minimum (~10 USDT notional). Rounded to cents.
+        """
+        if price <= 0 or cash_available <= 0:
+            return 0.0
+        budget = min(
+            self.cfg.quote_budget * self.cfg.per_trade_pct / 100.0,
+            cash_available,
+        )
+        if budget < MIN_NOTIONAL_QUOTE:
+            return 0.0
+        return round(budget, 2)
+
+    def entry_levels(self, price: float, atr: Optional[float] = None) -> Dict[str, float]:
+        """Stop-loss / take-profit for a fresh entry.
+
+        ATR mode (when enabled *and* a valid ATR is supplied) adapts to
+        volatility: ``SL = entry − sl_mult|ATR``. Otherwise fixed percentages.
+        """
+        if self.cfg.atr_stops and atr and atr > 0:
+            sl = price - self.cfg.atr_sl_mult * atr
+            tp = price + self.cfg.atr_tp_mult * atr
+            # Guard against pathological ATR (e.g. bad feed -> negative SL).
+            if sl <= 0 or sl >= price:
+                sl = price * (1 - self.cfg.stop_loss_pct / 100.0)
+            if tp <= price:
+                tp = price * (1 + self.cfg.take_profit_pct / 100.0)
+        else:
+            sl = price * (1 - self.cfg.stop_loss_pct / 100.0)
+            tp = price * (1 + self.cfg.take_profit_pct / 100.0)
+        return {"stop_loss": round(sl, 8), "take_profit": round(tp, 8)}
+
+    def note_entry(self, symbol: str) -> None:
+        self._last_entry_ts[symbol] = time.time()
+
+    def note_entry_ts(self, symbol: str, ts: float) -> None:
+        """Restore cooldown state from a persisted timestamp (restart recovery)."""
+        prev = self._last_entry_ts.get(symbol, 0.0)
+        if ts > prev:
+            self._last_entry_ts[symbol] = ts
+
+    # ---------------- exits ----------------
+    def check_exit(self, pos: Dict, price: float) -> ExitPlan:
+        cfg = self.cfg
+        entry = float(pos["entry_price"])
+        sl, tp = pos.get("stop_loss"), pos.get("take_profit")
+        sl = float(sl) if sl is not None else None
+        tp = float(tp) if tp is not None else None
+
+        # 1. hard stop-loss
+        if sl is not None and price <= sl:
+            return ExitPlan("exit", f"stop-loss hit ({price:.6g} <= SL {sl:.6g})", price)
+
+        # 2. take-profit
+        if tp is not None and price >= tp:
+            return ExitPlan("exit", f"take-profit hit ({price:.6g} >= TP {tp:.6g})", price)
+
+        # 3. trailing stop (ratchets stop up as price climbs)
+        if cfg.trailing_stop_pct > 0:
+            high = float(pos.get("trail_high") or entry)
+            if price > high:
+                high = price
+                new_sl = high * (1 - cfg.trailing_stop_pct / 100.0)
+                if sl is None or new_sl > sl:  # only ratchet upward
+                    sl = new_sl
+                try:
+                    self.store.update_trail(pos["id"], high, sl)
+                except Exception as e:
+                    log.warning("trail persist failed for %s: %s", pos.get("symbol"), e)
+                log.info("%s trail high=%.6g new SL=%.6g",
+                         pos.get("symbol"), high, sl)
+            trail_sl = high * (1 - cfg.trailing_stop_pct / 100.0)
+            if trail_sl > entry and price <= trail_sl:
+                return ExitPlan(
+                    "exit", f"trailing stop ({price:.6g} <= trail {trail_sl:.6g})", price
+                )
+        return ExitPlan("hold", "")
+
+
+def round_step(value: Decimal, step: Decimal) -> Decimal:
+    if step <= 0:
+        return value
+    steps = (value / step).to_integral_value(rounding="ROUND_DOWN")
+    return steps * step

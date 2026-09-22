@@ -1,0 +1,6 @@
+# core (required) — pure wheels, installs anywhere incl. Termux
+requests==2.32.3
+PyYAML==6.0.2
+
+# terminal UI — required for full experience; bot still runs without it (ASCII fallback)
+rich==13.9.4

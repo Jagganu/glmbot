@@ -1,0 +1,4 @@
+# Dev / CI tooling (desktop only — not needed on Termux)
+pytest>=8.3
+ruff>=0.6.9
+mypy>=1.11
