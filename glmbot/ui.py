@@ -172,7 +172,8 @@ def console() -> Any:
     """Process-wide shared console instance."""
     global _CONSOLE
     if _CONSOLE is None:
-        _CONSOLE = _make_console() if HAS_RICH else Console()
+        # NB: ternary is lazy - _make_console is only resolved when defined.
+        _CONSOLE = _make_console() if HAS_RICH and not _PLAIN else Console()
     return _CONSOLE
 
 

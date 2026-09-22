@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import random
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -504,6 +505,31 @@ class TestMinVotesConsensus(unittest.TestCase):
         n, min_votes = 4, 2
         need = min_votes if min_votes > 0 else n
         self.assertFalse(len(buys) >= need and len(sells) == 0)
+
+
+class TestNoColorCLI(unittest.TestCase):
+    """Regression: --no-color must boot and emit zero ANSI bytes (legacy conhost)."""
+
+    def _run(self, *argv):
+        return subprocess.run(
+            [sys.executable, "bot.py", *argv],
+            cwd=str(Path(__file__).parent),
+            capture_output=True,
+            timeout=90,
+        )
+
+    def test_no_color_version_clean(self):
+        p = self._run("--no-color", "version")
+        self.assertEqual(p.returncode, 0, p.stderr.decode("utf-8", "replace")[-500:])
+        self.assertNotIn(b"\x1b", p.stdout + p.stderr)
+
+    def test_no_color_strategies_json_parses(self):
+        import json
+
+        p = self._run("--no-color", "strategies", "--json")
+        self.assertEqual(p.returncode, 0, p.stderr.decode("utf-8", "replace")[-500:])
+        names = [s["name"] for s in json.loads(p.stdout)]
+        self.assertIn("ema_cross", names)
 
 
 if __name__ == "__main__":
