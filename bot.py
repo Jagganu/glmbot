@@ -780,10 +780,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(_hoist_global_flags(sys.argv[1:] if argv is None else argv))
     if args.no_color:
-        import os
+        from glmbot.ui import set_no_color
 
-        os.environ["NO_COLOR"] = "1"
-        os.environ["TERM"] = "dumb"
+        set_no_color()
     setup_logging(args.verbose, log_file=args.log_file)
     try:
         return int(args.fn(args) or 0)

@@ -156,6 +156,23 @@ def console() -> Any:
     return _CONSOLE
 
 
+def set_no_color() -> None:
+    """Force plain output everywhere (old conhost can't render ANSI codes).
+
+    Must work even though the shared console (and Rich log handler) may
+    already exist: flip the live instance and set the env for future ones.
+    """
+    import contextlib
+    import os
+
+    os.environ["NO_COLOR"] = "1"
+    os.environ["TERM"] = "dumb"
+    global _CONSOLE
+    if _CONSOLE is not None and hasattr(_CONSOLE, "no_color"):
+        with contextlib.suppress(Exception):
+            _CONSOLE.no_color = True
+
+
 BANNER = r"""
    ____ _     __  __ ____   ___ _____
   / ___| |   |  \/  | __ ) / _ \_   _|
