@@ -7,14 +7,15 @@ Design goals
   - ``banner()``, ``rule()``, ``status_line()`` helpers keep CLI output
     consistent and professional across commands.
 """
+
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any
 
 try:
     from rich.console import Console as _RichConsole
     from rich.panel import Panel as _RichPanel
-    from rich.progress import Progress as _RichProgress, BarColumn, TextColumn, TimeElapsedColumn
+    from rich.progress import Progress as _RichProgress
     from rich.table import Table as _RichTable
 
     HAS_RICH = True
@@ -41,14 +42,14 @@ class PlainConsole:
 
 
 def _strip_markup(text: str) -> str:
-    out: List[str] = []
+    out: list[str] = []
     i, n = 0, len(text)
     while i < n:
         ch = text[i]
         if ch == "[":
             j = text.find("]", i)
             if j != -1:
-                tag = text[i + 1:j]
+                tag = text[i + 1 : j]
                 if " " not in tag and "\n" not in tag and len(tag) < 40:
                     i = j + 1
                     continue
@@ -60,9 +61,9 @@ def _strip_markup(text: str) -> str:
 class PlainTable:
     def __init__(self, title: str = "", show_lines: bool = False, **kw: Any):
         self.title = title
-        self.columns: List[str] = []
-        self.rows: List[List[str]] = []
-        self._justify: List[str] = []
+        self.columns: list[str] = []
+        self.rows: list[list[str]] = []
+        self._justify: list[str] = []
 
     def add_column(self, name: str, justify: str = "left", **kw: Any) -> None:
         self.columns.append(name)
@@ -71,7 +72,7 @@ class PlainTable:
     def add_row(self, *cells: Any, **kw: Any) -> None:
         self.rows.append([_strip_markup(str(c)) for c in cells])
 
-    def _widths(self) -> List[int]:
+    def _widths(self) -> list[int]:
         w = [len(c) for c in self.columns]
         for r in self.rows:
             for i, cell in enumerate(r):
@@ -93,7 +94,9 @@ class PlainTable:
 
         lines = [sep, head, sep]
         for r in rows:
-            lines.append("|" + "|".join(fmt(r[i], w[i], self._justify[i]) for i in range(len(w))) + "|")
+            lines.append(
+                "|" + "|".join(fmt(r[i], w[i], self._justify[i]) for i in range(len(w))) + "|"
+            )
         lines.append(sep)
         if self.title:
             pad = max(0, (len(sep) - len(self.title)) // 2)
@@ -142,17 +145,14 @@ else:
     Panel = PlainPanel  # type: ignore[assignment]
     Progress = None  # type: ignore[assignment]
 
-_CONSOLE: Optional[Any] = None
+_CONSOLE: Any | None = None
 
 
 def console() -> Any:
     """Process-wide shared console instance."""
     global _CONSOLE
     if _CONSOLE is None:
-        if HAS_RICH:
-            _CONSOLE = _make_console()
-        else:
-            _CONSOLE = Console()
+        _CONSOLE = _make_console() if HAS_RICH else Console()
     return _CONSOLE
 
 

@@ -14,12 +14,12 @@ Built-ins: ema_cross, rsi_reversion, macd, bollinger, supertrend,
 donchian_breakout. Add new ones by subclassing :class:`Strategy` and
 registering in :data:`REGISTRY`.
 """
+
 from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, List, Optional
 
 from .indicators import bollinger, donchian, ema, macd, rsi, supertrend
 from .klines import Klines
@@ -31,7 +31,7 @@ BUY, SELL, HOLD = "BUY", "SELL", "HOLD"
 
 @dataclass
 class Signal:
-    side: str            # BUY | SELL | HOLD
+    side: str  # BUY | SELL | HOLD
     reason: str
     symbol: str
     price: float
@@ -46,19 +46,20 @@ class Signal:
 class StrategyMeta:
     name: str
     description: str
-    params: Dict[str, str]  # param -> "default (meaning)"
+    params: dict[str, str]  # param -> "default (meaning)"
 
 
 class Strategy(ABC):
     name = "base"
     meta: StrategyMeta = StrategyMeta("base", "base class", {})
 
-    def __init__(self, params: Optional[Dict] = None):
+    def __init__(self, params: dict | None = None):
         self.params = dict(params or {})
         self.validate_params()
 
     def validate_params(self) -> None:
         """Override to reject bad config early (raises ValueError)."""
+        return None
 
     @abstractmethod
     def evaluate(self, symbol: str, k: Klines) -> Signal:
@@ -73,7 +74,8 @@ class EMACross(Strategy):
 
     name = "ema_cross"
     meta = StrategyMeta(
-        "ema_cross", "BUY on fast-EMA cross above slow-EMA; SELL on cross below.",
+        "ema_cross",
+        "BUY on fast-EMA cross above slow-EMA; SELL on cross below.",
         {"fast": "9 (fast EMA period)", "slow": "21 (slow EMA period)"},
     )
 
@@ -94,7 +96,13 @@ class EMACross(Strategy):
         closes = k.close
         price = float(closes[-1]) if closes else 0.0
         if len(closes) < self.slow + 2:
-            return Signal(HOLD, f"insufficient history ({len(closes)}/{self.slow + 2})", symbol, price, self.name)
+            return Signal(
+                HOLD,
+                f"insufficient history ({len(closes)}/{self.slow + 2})",
+                symbol,
+                price,
+                self.name,
+            )
         f = ema(closes, self.fast)
         s = ema(closes, self.slow)
         if f[-2] is None or s[-2] is None or f[-1] is None or s[-1] is None:
@@ -102,9 +110,13 @@ class EMACross(Strategy):
         prev_diff = f[-2] - s[-2]  # type: ignore[operator]
         curr_diff = f[-1] - s[-1]  # type: ignore[operator]
         if prev_diff <= 0 < curr_diff:
-            return Signal(BUY, f"EMA{self.fast} crossed above EMA{self.slow}", symbol, price, self.name)
+            return Signal(
+                BUY, f"EMA{self.fast} crossed above EMA{self.slow}", symbol, price, self.name
+            )
         if prev_diff >= 0 > curr_diff:
-            return Signal(SELL, f"EMA{self.fast} crossed below EMA{self.slow}", symbol, price, self.name)
+            return Signal(
+                SELL, f"EMA{self.fast} crossed below EMA{self.slow}", symbol, price, self.name
+            )
         return Signal(HOLD, "no cross", symbol, price, self.name)
 
 
@@ -113,7 +125,8 @@ class RSIReversion(Strategy):
 
     name = "rsi_reversion"
     meta = StrategyMeta(
-        "rsi_reversion", "BUY on RSI recovery above oversold; SELL on drop below overbought.",
+        "rsi_reversion",
+        "BUY on RSI recovery above oversold; SELL on drop below overbought.",
         {"period": "14", "oversold": "30", "overbought": "70"},
     )
 
@@ -142,9 +155,13 @@ class RSIReversion(Strategy):
         if prev is None or cur is None:
             return Signal(HOLD, "rsi warmup", symbol, price, self.name)
         if prev <= self.os < cur:
-            return Signal(BUY, f"RSI recovered above {self.os:g} ({cur:.1f})", symbol, price, self.name)
+            return Signal(
+                BUY, f"RSI recovered above {self.os:g} ({cur:.1f})", symbol, price, self.name
+            )
         if prev >= self.ob > cur:
-            return Signal(SELL, f"RSI dropped below {self.ob:g} ({cur:.1f})", symbol, price, self.name)
+            return Signal(
+                SELL, f"RSI dropped below {self.ob:g} ({cur:.1f})", symbol, price, self.name
+            )
         return Signal(HOLD, f"RSI {cur:.1f}", symbol, price, self.name)
 
 
@@ -153,7 +170,8 @@ class MACDStrategy(Strategy):
 
     name = "macd"
     meta = StrategyMeta(
-        "macd", "BUY on MACD cross above signal; SELL on cross below.",
+        "macd",
+        "BUY on MACD cross above signal; SELL on cross below.",
         {"fast": "12", "slow": "26", "signal": "9"},
     )
 
@@ -190,7 +208,8 @@ class BollingerStrategy(Strategy):
 
     name = "bollinger"
     meta = StrategyMeta(
-        "bollinger", "BUY at lower band touch; SELL at upper band touch.",
+        "bollinger",
+        "BUY at lower band touch; SELL at upper band touch.",
         {"period": "20", "std_dev": "2.0 (band width)"},
     )
 
@@ -224,7 +243,8 @@ class SupertrendStrategy(Strategy):
 
     name = "supertrend"
     meta = StrategyMeta(
-        "supertrend", "BUY when supertrend flips up; SELL when it flips down.",
+        "supertrend",
+        "BUY when supertrend flips up; SELL when it flips down.",
         {"period": "10 (ATR period)", "multiplier": "3.0 (band distance)"},
     )
 
@@ -257,7 +277,8 @@ class DonchianBreakout(Strategy):
 
     name = "donchian_breakout"
     meta = StrategyMeta(
-        "donchian_breakout", "BUY on N-bar high breakout; SELL on N-bar low breakdown.",
+        "donchian_breakout",
+        "BUY on N-bar high breakout; SELL on N-bar low breakdown.",
         {"period": "20 (channel lookback)"},
     )
 
@@ -283,7 +304,7 @@ class DonchianBreakout(Strategy):
         return Signal(HOLD, "inside channel", symbol, price, self.name)
 
 
-REGISTRY: Dict[str, type] = {
+REGISTRY: dict[str, type] = {
     EMACross.name: EMACross,
     RSIReversion.name: RSIReversion,
     MACDStrategy.name: MACDStrategy,
@@ -292,12 +313,12 @@ REGISTRY: Dict[str, type] = {
     DonchianBreakout.name: DonchianBreakout,
 }
 
-STRATEGY_CATALOG: List[StrategyMeta] = [cls.meta for cls in REGISTRY.values()]
+STRATEGY_CATALOG: list[StrategyMeta] = [cls.meta for cls in REGISTRY.values()]
 
 
-def build_strategies(names: List[str], params: Dict[str, Dict]) -> List[Strategy]:
+def build_strategies(names: list[str], params: dict[str, dict]) -> list[Strategy]:
     """Instantiate strategies by name; raises ValueError on unknown/invalid."""
-    out: List[Strategy] = []
+    out: list[Strategy] = []
     for n in names:
         cls = REGISTRY.get(n)
         if cls is None:

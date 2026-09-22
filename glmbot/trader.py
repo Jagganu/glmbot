@@ -11,14 +11,15 @@ Ops features: startup preflight (keys/balance/filters/leverage), graceful
 SIGINT/SIGTERM shutdown, heartbeat file (``data/glmbot.heartbeat``), cycle
 timing stats, stale-quote detection, restart cooldown restore.
 """
+
 from __future__ import annotations
 
+import contextlib
 import logging
 import signal
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
 
 from .api import BinanceClient
 from .broker import Broker, PaperBroker
@@ -38,8 +39,14 @@ STALE_QUOTE_SEC = 15 * 60 + 120  # a 15m close older than this is suspicious
 
 
 class Trader:
-    def __init__(self, cfg: BotConfig, store: Store, client: BinanceClient,
-                 broker: Broker, notifier: Notifier):
+    def __init__(
+        self,
+        cfg: BotConfig,
+        store: Store,
+        client: BinanceClient,
+        broker: Broker,
+        notifier: Notifier,
+    ):
         self.cfg = cfg
         self.store = store
         self.client = client
@@ -49,12 +56,10 @@ class Trader:
         self.risk = RiskManager(cfg.risk, store)
         self._stop = False
         self._cycles = 0
-        self._cycle_ms: List[float] = []
+        self._cycle_ms: list[float] = []
         for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
+            with contextlib.suppress(OSError, ValueError):  # Windows / non-main-thread
                 signal.signal(sig, self._handle_stop)
-            except (OSError, ValueError):
-                pass  # Windows / non-main-thread
 
     # ---------------- lifecycle ----------------
     def _handle_stop(self, *_a) -> None:
@@ -62,9 +67,9 @@ class Trader:
             log.info("shutdown signal received - finishing current cycle...")
         self._stop = True
 
-    def preflight(self) -> List[str]:
+    def preflight(self) -> list[str]:
         """Startup checks. Returns warnings (empty = clean). Raises on fatal."""
-        warnings: List[str] = []
+        warnings: list[str] = []
         # 1. clock sync
         try:
             offset = self.client.sync_time()
@@ -74,20 +79,27 @@ class Trader:
             warnings.append(f"time sync failed: {e}")
         # 2. connectivity
         if not self.client.ping():
-            raise RuntimeError("Binance REST unreachable (ping failed) - check network/VPN/geo-block")
+            raise RuntimeError(
+                "Binance REST unreachable (ping failed) - check network/VPN/geo-block"
+            )
         # 3. keys in live mode
-        if self.cfg.mode == "live" and (not self.cfg.api_key or self.cfg.api_key.startswith("YOUR_")):
+        if self.cfg.mode == "live" and (
+            not self.cfg.api_key or self.cfg.api_key.startswith("YOUR_")
+        ):
             raise RuntimeError("live mode requires api.key (or GLMBOT_API_KEY)")
         # 4. balance sanity
         try:
             cash = self._cash()
             if cash <= 0:
-                warnings.append(f"quote balance is {cash:.2f} {self.cfg.quote_asset} - deposits needed?")
+                warnings.append(
+                    f"quote balance is {cash:.2f} {self.cfg.quote_asset} - deposits needed?"
+                )
             elif cash < self.cfg.risk.quote_budget:
                 warnings.append(
                     f"exchange balance {cash:.2f} < configured quote_budget "
                     f"{self.cfg.risk.quote_budget:.2f} - sizing uses the budget; "
-                    "entries may fail on insufficient funds")
+                    "entries may fail on insufficient funds"
+                )
         except Exception as e:
             warnings.append(f"balance check failed: {e}")
         # 5. filters for every symbol (fail fast on delisted/typo'd symbols)
@@ -100,6 +112,7 @@ class Trader:
         if self.cfg.market == "futures" and self.cfg.mode == "live":
             try:
                 from .broker import FuturesBroker
+
                 if isinstance(self.broker, FuturesBroker):
                     for sym in self.cfg.symbols[:3]:
                         self.client.set_leverage(sym, self.cfg.leverage)
@@ -120,7 +133,7 @@ class Trader:
             log.warning("%s kline quality: %s", symbol, "; ".join(issues[:2]))
         return k
 
-    def _atr(self, k: Klines) -> Optional[float]:
+    def _atr(self, k: Klines) -> float | None:
         try:
             period = self.cfg.risk.atr_period
             if len(k.close) < period + 1:
@@ -139,7 +152,7 @@ class Trader:
             log.warning("%s quote is stale (%ds old)", symbol, age_ms // 1000)
         return float(kl[-1]["close"])
 
-    def _consensus(self, symbol: str, df: Optional[Klines] = None) -> Optional[Signal]:
+    def _consensus(self, symbol: str, df: Klines | None = None) -> Signal | None:
         """Vote-based entry signal.
 
         ``min_votes=0`` (default) requires ALL strategies to agree;
@@ -147,15 +160,13 @@ class Trader:
         Unanimous SELL is returned as an exit signal regardless.
         """
         df = df if df is not None else self._df(symbol)
-        votes: List[Signal] = []
+        votes: list[Signal] = []
         for strat in self.strategies:
             try:
                 sig = strat.evaluate(symbol, df)
                 votes.append(sig)
-                try:
+                with contextlib.suppress(Exception):
                     self.store.log_signal(sig)
-                except Exception:
-                    pass
             except Exception as e:
                 log.error("strategy %s failed on %s: %s", strat.name, symbol, e)
         if not votes:
@@ -171,14 +182,14 @@ class Trader:
             return sells[0]
         return None
 
-    def _quotes(self) -> Dict[str, float]:
+    def _quotes(self) -> dict[str, float]:
         # Batch path first (one HTTP call), per-symbol fallback for resilience.
         try:
             if hasattr(self.client, "ticker_prices"):
                 return self.client.ticker_prices(list(self.cfg.symbols))
         except Exception as e:
             log.debug("batch price fetch failed, falling back per-symbol: %s", e)
-        out: Dict[str, float] = {}
+        out: dict[str, float] = {}
         for s in self.cfg.symbols:
             try:
                 out[s] = self._price(s)
@@ -187,7 +198,7 @@ class Trader:
         return out
 
     # ---------------- main loop ----------------
-    def run_once(self) -> Dict[str, int]:
+    def run_once(self) -> dict[str, int]:
         """One full sense->decide->act cycle. Returns cycle counters (for tests/ops)."""
         t0 = time.time()
         mode = self.cfg.mode
@@ -270,8 +281,15 @@ class Trader:
         self._cycle_ms.append(dt_ms)
         if len(self._cycle_ms) > 50:
             self._cycle_ms.pop(0)
-        log.info("cycle done: cash=%.2f positions=%.2f total=%.2f (+%d/-%d, %.0fms)",
-                 cash, pos_val, total, stats["entries"], stats["exits"], dt_ms)
+        log.info(
+            "cycle done: cash=%.2f positions=%.2f total=%.2f (+%d/-%d, %.0fms)",
+            cash,
+            pos_val,
+            total,
+            stats["entries"],
+            stats["exits"],
+            dt_ms,
+        )
         self._heartbeat()
         return stats
 
@@ -306,12 +324,17 @@ class Trader:
             return False
         levels = self.risk.entry_levels(fill["price"], atr_val)
         try:
-            self.store.open_position({
-                "symbol": symbol, "strategy": sig.strategy,
-                "entry_price": fill["price"], "qty": fill["qty"],
-                "stop_loss": levels["stop_loss"], "take_profit": levels["take_profit"],
-                "mode": mode,
-            })
+            self.store.open_position(
+                {
+                    "symbol": symbol,
+                    "strategy": sig.strategy,
+                    "entry_price": fill["price"],
+                    "qty": fill["qty"],
+                    "stop_loss": levels["stop_loss"],
+                    "take_profit": levels["take_profit"],
+                    "mode": mode,
+                }
+            )
         except Exception as e:
             # Fill happened but journaling failed - alert loudly (position exists
             # on exchange but not in DB). Operator must reconcile manually.
@@ -320,73 +343,110 @@ class Trader:
             return False
         self.risk.note_entry(symbol)
         try:
-            self.store.insert_trade({
-                "ts": utcnow(), "mode": mode, "symbol": symbol, "side": "BUY",
-                "qty": fill["qty"], "price": fill["price"], "quote_amt": fill["quote_amt"],
-                "fee": fill["fee"], "reason": sig.reason,
-                "exchange_order_id": str(fill.get("order_id") or ""), "raw": "",
-            })
+            self.store.insert_trade(
+                {
+                    "ts": utcnow(),
+                    "mode": mode,
+                    "symbol": symbol,
+                    "side": "BUY",
+                    "qty": fill["qty"],
+                    "price": fill["price"],
+                    "quote_amt": fill["quote_amt"],
+                    "fee": fill["fee"],
+                    "reason": sig.reason,
+                    "exchange_order_id": str(fill.get("order_id") or ""),
+                    "raw": "",
+                }
+            )
         except Exception as e:
             log.error("trade journal failed (BUY %s): %s", symbol, e)
-        msg = format_buy(mode, symbol, fill["qty"], fill["price"], fill["quote_amt"],
-                         self.cfg.quote_asset, levels["stop_loss"], levels["take_profit"],
-                         sig.reason, self.cfg.leverage, self.cfg.market)
+        msg = format_buy(
+            mode,
+            symbol,
+            fill["qty"],
+            fill["price"],
+            fill["quote_amt"],
+            self.cfg.quote_asset,
+            levels["stop_loss"],
+            levels["take_profit"],
+            sig.reason,
+            self.cfg.leverage,
+            self.cfg.market,
+        )
         log.info(msg)
         self.notifier.trade(msg)
         if isinstance(self.broker, PaperBroker):
-            try:
+            with contextlib.suppress(Exception):
                 self.store.set_paper_state(self.broker.cash)
-            except Exception:
-                pass
         return True
 
-    def _close_position(self, pos: Dict, price: float, reason: str) -> bool:
+    def _close_position(self, pos: dict, price: float, reason: str) -> bool:
         mode = self.cfg.mode
         symbol = pos["symbol"]
         try:
-            fill = self.broker.sell_market(symbol, pos["qty"], price,
-                                           entry_price=pos["entry_price"])
+            fill = self.broker.sell_market(
+                symbol, pos["qty"], price, entry_price=pos["entry_price"]
+            )
         except Exception as e:
             log.error("SELL %s failed: %s", symbol, e)
             self.notifier.error(f"[{mode}] SELL {symbol} FAILED: {e}")
             return False
         exit_price = float(fill["price"])
-        pnl = float(fill["gross"]) - float(pos["entry_price"]) * float(pos["qty"]) - float(fill["fee"])
+        pnl = (
+            float(fill["gross"])
+            - float(pos["entry_price"]) * float(pos["qty"])
+            - float(fill["fee"])
+        )
         try:
             self.store.close_position(pos["id"], exit_price, pnl)
-            self.store.insert_trade({
-                "ts": utcnow(), "mode": mode, "symbol": symbol, "side": "SELL",
-                "qty": fill["qty"], "price": exit_price, "quote_amt": fill["gross"],
-                "fee": fill["fee"], "reason": reason,
-                "exchange_order_id": str(fill.get("order_id") or ""), "raw": "",
-            })
+            self.store.insert_trade(
+                {
+                    "ts": utcnow(),
+                    "mode": mode,
+                    "symbol": symbol,
+                    "side": "SELL",
+                    "qty": fill["qty"],
+                    "price": exit_price,
+                    "quote_amt": fill["gross"],
+                    "fee": fill["fee"],
+                    "reason": reason,
+                    "exchange_order_id": str(fill.get("order_id") or ""),
+                    "raw": "",
+                }
+            )
         except Exception as e:
             log.error("JOURNAL FAILED after SELL %s: %s", symbol, e)
             self.notifier.error(f"[{mode}] SELL {symbol} filled but JOURNAL FAILED: {e}")
             return False
         pct = (exit_price / pos["entry_price"] - 1) * 100 if pos["entry_price"] else 0.0
-        msg = format_sell(mode, symbol, fill["qty"], exit_price, pnl,
-                          self.cfg.quote_asset, pct, reason,
-                          self.cfg.leverage, self.cfg.market)
+        msg = format_sell(
+            mode,
+            symbol,
+            fill["qty"],
+            exit_price,
+            pnl,
+            self.cfg.quote_asset,
+            pct,
+            reason,
+            self.cfg.leverage,
+            self.cfg.market,
+        )
         log.info(msg)
         self.notifier.trade(msg)
         if isinstance(self.broker, PaperBroker):
-            try:
+            with contextlib.suppress(Exception):
                 self.store.set_paper_state(self.broker.cash)
-            except Exception:
-                pass
         return True
 
     # ---------------- ops ----------------
     def _heartbeat(self) -> None:
         try:
             HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
-            HEARTBEAT_FILE.write_text(
-                datetime.now(timezone.utc).isoformat(), encoding="utf-8")
+            HEARTBEAT_FILE.write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
         except Exception:
             pass
 
-    def cycle_stats(self) -> Dict[str, float]:
+    def cycle_stats(self) -> dict[str, float]:
         ms = self._cycle_ms
         return {
             "cycles": float(self._cycles),
@@ -401,19 +461,22 @@ class Trader:
             if not opened:
                 continue
             try:
-                dt = datetime.strptime(opened, "%Y-%m-%dT%H:%M:%SZ").replace(
-                    tzinfo=timezone.utc)
+                dt = datetime.strptime(opened, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
                 self.risk.note_entry_ts(pos["symbol"], dt.timestamp())
             except Exception:
                 pass
         if positions:
-            log.info("restored %d open position(s) + cooldowns from journal",
-                     len(positions))
+            log.info("restored %d open position(s) + cooldowns from journal", len(positions))
 
     def run_forever(self) -> None:
-        log.info("starting glmbot: mode=%s market=%s symbols=%s strategies=%s interval=%ss",
-                 self.cfg.mode, self.cfg.market, self.cfg.symbols,
-                 [s.name for s in self.strategies], self.cfg.update_interval_sec)
+        log.info(
+            "starting glmbot: mode=%s market=%s symbols=%s strategies=%s interval=%ss",
+            self.cfg.mode,
+            self.cfg.market,
+            self.cfg.symbols,
+            [s.name for s in self.strategies],
+            self.cfg.update_interval_sec,
+        )
         warnings = []
         try:
             warnings = self.preflight()
@@ -436,8 +499,7 @@ class Trader:
             try:
                 quotes = self._quotes()
                 if not quotes and offline_cycles >= 3:
-                    log.warning("offline for %d cycles - exits unmanaged, retrying",
-                                offline_cycles)
+                    log.warning("offline for %d cycles - exits unmanaged, retrying", offline_cycles)
                 self.run_once()
                 self._cycles += 1
                 offline_cycles = 0 if quotes else offline_cycles + 1
@@ -445,10 +507,8 @@ class Trader:
                 break
             except Exception as e:
                 log.exception("cycle error: %s", e)
-                try:
+                with contextlib.suppress(Exception):
                     self.notifier.error(f"glmbot cycle error: {e}")
-                except Exception:
-                    pass
             if self._stop:
                 break
             elapsed = time.time() - start

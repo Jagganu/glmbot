@@ -19,18 +19,20 @@ Fidelity notes (what matches live, what is simplified):
 Metrics per symbol: trades, win rate, PnL%, max drawdown, fees, Sharpe,
 profit factor, expectancy, avg win/loss, exposure %, buy-and-hold delta.
 """
+
 from __future__ import annotations
 
+import contextlib
 import csv
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
 
 from .config import BotConfig
 from .indicators import atr as atr_fn
 from .klines import Klines
-from .metrics import max_drawdown as md_fn, profit_factor, sharpe_ratio, sortino_ratio
+from .metrics import max_drawdown as md_fn
+from .metrics import profit_factor, sharpe_ratio, sortino_ratio
 from .strategies import BUY, SELL, Signal, build_strategies
 
 log = logging.getLogger("glmbot.backtest")
@@ -42,8 +44,8 @@ FUT_TAKER_FEE = 0.0005
 @dataclass
 class BTTrade:
     symbol: str
-    side: str            # BUY | SELL
-    ts: int              # open_time in ms
+    side: str  # BUY | SELL
+    ts: int  # open_time in ms
     price: float
     qty: float
     reason: str
@@ -54,7 +56,7 @@ class BTTrade:
 @dataclass
 class BTResult:
     symbol: str
-    trades: List[BTTrade] = field(default_factory=list)
+    trades: list[BTTrade] = field(default_factory=list)
     final_equity: float = 0.0
     start_equity: float = 0.0
     n_trades: int = 0
@@ -73,21 +75,27 @@ class BTResult:
     sortino: float = 0.0
     exposure_pct: float = 0.0
     buy_hold_pct: float = 0.0
-    equity_curve: List[float] = field(default_factory=list)
+    equity_curve: list[float] = field(default_factory=list)
 
     @property
     def pnl_pct(self) -> float:
         return (self.final_equity / self.start_equity - 1) * 100 if self.start_equity else 0.0
 
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> dict:
         return {
-            "symbol": self.symbol, "n_trades": self.n_trades, "n_wins": self.n_wins,
-            "win_rate": round(self.win_rate, 2), "pnl_pct": round(self.pnl_pct, 2),
+            "symbol": self.symbol,
+            "n_trades": self.n_trades,
+            "n_wins": self.n_wins,
+            "win_rate": round(self.win_rate, 2),
+            "pnl_pct": round(self.pnl_pct, 2),
             "max_drawdown_pct": round(self.max_drawdown_pct, 2),
             "total_fees": round(self.total_fees, 2),
-            "profit_factor": round(self.profit_factor, 2) if self.profit_factor != float("inf") else None,
+            "profit_factor": round(self.profit_factor, 2)
+            if self.profit_factor != float("inf")
+            else None,
             "expectancy": round(self.expectancy, 2),
-            "sharpe_15m": round(self.sharpe, 2), "sortino_15m": round(self.sortino, 2),
+            "sharpe_15m": round(self.sharpe, 2),
+            "sortino_15m": round(self.sortino, 2),
             "exposure_pct": round(self.exposure_pct, 1),
             "buy_hold_pct": round(self.buy_hold_pct, 2),
             "final_equity": round(self.final_equity, 2),
@@ -97,8 +105,9 @@ class BTResult:
 class Backtester:
     """Walk-forward backtester: iterate candles, same rules as live."""
 
-    def __init__(self, cfg: BotConfig, klines: Dict[str, Klines],
-                 starting_equity: Optional[float] = None):
+    def __init__(
+        self, cfg: BotConfig, klines: dict[str, Klines], starting_equity: float | None = None
+    ):
         self.cfg = cfg
         self.klines = klines
         self.risk_cfg = cfg.risk
@@ -110,28 +119,36 @@ class Backtester:
         self.slip = max(0.0, cfg.risk.slippage_bps) / 10_000.0
 
     # ---------------- public ----------------
-    def run(self) -> Dict[str, BTResult]:
-        results: Dict[str, BTResult] = {}
+    def run(self) -> dict[str, BTResult]:
+        results: dict[str, BTResult] = {}
         for symbol, k in self.klines.items():
             try:
                 results[symbol] = self._run_symbol(symbol, k)
             except Exception as e:
                 log.error("backtest failed for %s: %s", symbol, e)
-                r = BTResult(symbol=symbol, start_equity=self.starting,
-                             final_equity=self.starting)
+                r = BTResult(symbol=symbol, start_equity=self.starting, final_equity=self.starting)
                 results[symbol] = r
         return results
 
-    def export_trades_csv(self, results: Dict[str, BTResult], path: str) -> str:
+    def export_trades_csv(self, results: dict[str, BTResult], path: str) -> str:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(["symbol", "side", "ts_ms", "price", "qty", "fee", "proceeds", "reason"])
             for sym in sorted(results):
                 for t in results[sym].trades:
-                    w.writerow([t.symbol, t.side, t.ts, f"{t.price:.8f}",
-                                f"{t.qty:.8f}", f"{t.fee:.4f}",
-                                f"{t.proceeds:.2f}", t.reason])
+                    w.writerow(
+                        [
+                            t.symbol,
+                            t.side,
+                            t.ts,
+                            f"{t.price:.8f}",
+                            f"{t.qty:.8f}",
+                            f"{t.fee:.4f}",
+                            f"{t.proceeds:.2f}",
+                            t.reason,
+                        ]
+                    )
         return path
 
     # ---------------- engine ----------------
@@ -141,10 +158,10 @@ class Backtester:
         qty = 0.0
         entry_price = 0.0
         margin_locked = 0.0
-        stop_loss: Optional[float] = None
-        take_profit: Optional[float] = None
-        trail_high: Optional[float] = None
-        equity_curve: List[float] = []
+        stop_loss: float | None = None
+        take_profit: float | None = None
+        trail_high: float | None = None
+        equity_curve: list[float] = []
         bars_in_pos = 0
 
         closes = k.close
@@ -157,7 +174,7 @@ class Backtester:
         res.buy_hold_pct = buy_hold
 
         # Precompute ATR series once (used only when atr_stops enabled).
-        atr_s: List[Optional[float]] = [None] * n
+        atr_s: list[float | None] = [None] * n
         if self.risk_cfg.atr_stops:
             try:
                 atr_s = atr_fn(k.high, k.low, k.close, self.risk_cfg.atr_period)
@@ -165,7 +182,7 @@ class Backtester:
                 atr_s = [None] * n
 
         min_rows = max(60, self._warmup_rows())
-        pending_entry: Optional[Dict] = None  # signal bar -> fill next bar
+        pending_entry: dict | None = None  # signal bar -> fill next bar
 
         for i in range(min_rows, n):
             window = Klines(k.rows(i + 1))
@@ -187,9 +204,17 @@ class Backtester:
                             entry_price = fill_price
                             stop_loss, take_profit = self._levels(fill_price, atr_s[i])
                             trail_high = fill_price
-                            res.trades.append(BTTrade(
-                                symbol, "BUY", times[i], fill_price, qty,
-                                pending_entry["reason"], fee=fee))
+                            res.trades.append(
+                                BTTrade(
+                                    symbol,
+                                    "BUY",
+                                    times[i],
+                                    fill_price,
+                                    qty,
+                                    pending_entry["reason"],
+                                    fee=fee,
+                                )
+                            )
                     else:
                         fee = budget * self.fee_rate
                         qty = (budget - fee) / fill_price
@@ -198,15 +223,23 @@ class Backtester:
                         entry_price = fill_price
                         stop_loss, take_profit = self._levels(fill_price, atr_s[i])
                         trail_high = fill_price
-                        res.trades.append(BTTrade(
-                            symbol, "BUY", times[i], fill_price, qty,
-                            pending_entry["reason"], fee=fee))
+                        res.trades.append(
+                            BTTrade(
+                                symbol,
+                                "BUY",
+                                times[i],
+                                fill_price,
+                                qty,
+                                pending_entry["reason"],
+                                fee=fee,
+                            )
+                        )
                 pending_entry = None
 
             # ---- manage open position exits (at this bar's close) ----
             if qty > 0:
                 bars_in_pos += 1
-                exit_reason: Optional[str] = None
+                exit_reason: str | None = None
                 if stop_loss is not None and close <= stop_loss:
                     exit_reason = "stop-loss"
                 elif take_profit is not None and close >= take_profit:
@@ -225,8 +258,9 @@ class Backtester:
                     if votes and all(v.side == SELL for v in votes):
                         exit_reason = f"signal exit: {votes[0].reason}"
                 if exit_reason is not None:
-                    t = self._sell(res, symbol, times[i], close, qty, entry_price,
-                                   margin_locked, exit_reason)
+                    t = self._sell(
+                        res, symbol, times[i], close, qty, entry_price, margin_locked, exit_reason
+                    )
                     cash += t.proceeds
                     qty, margin_locked = 0.0, 0.0
                     stop_loss = take_profit = trail_high = None
@@ -247,8 +281,16 @@ class Backtester:
 
         # close residual at last close
         if qty > 0:
-            t = self._sell(res, symbol, times[-1], float(closes[-1]), qty,
-                           entry_price, margin_locked, "backtest-end")
+            t = self._sell(
+                res,
+                symbol,
+                times[-1],
+                float(closes[-1]),
+                qty,
+                entry_price,
+                margin_locked,
+                "backtest-end",
+            )
             cash += t.proceeds
             res.trades.append(t)
             equity_curve.append(cash)
@@ -264,22 +306,23 @@ class Backtester:
         need = 30
         p = self.cfg.strategy_params
         need = max(need, int(p.get("ema_cross", {}).get("slow", 21)) + 2)
-        need = max(need, int(p.get("macd", {}).get("slow", 26)) + int(p.get("macd", {}).get("signal", 9)) + 2)
+        need = max(
+            need,
+            int(p.get("macd", {}).get("slow", 26)) + int(p.get("macd", {}).get("signal", 9)) + 2,
+        )
         need = max(need, int(p.get("bollinger", {}).get("period", 20)) + 2)
         if self.risk_cfg.atr_stops:
             need = max(need, self.risk_cfg.atr_period + 2)
         return need
 
-    def _votes(self, symbol: str, window: Klines) -> List[Signal]:
-        votes: List[Signal] = []
+    def _votes(self, symbol: str, window: Klines) -> list[Signal]:
+        votes: list[Signal] = []
         for strat in self.strategies:
-            try:
+            with contextlib.suppress(Exception):
                 votes.append(strat.evaluate(symbol, window))
-            except Exception:
-                pass
         return votes
 
-    def _levels(self, price: float, atr_val: Optional[float]):
+    def _levels(self, price: float, atr_val: float | None):
         if self.risk_cfg.atr_stops and atr_val and atr_val > 0:
             sl = price - self.risk_cfg.atr_sl_mult * atr_val
             tp = price + self.risk_cfg.atr_tp_mult * atr_val
@@ -292,8 +335,17 @@ class Backtester:
             tp = price * (1 + self.risk_cfg.take_profit_pct / 100)
         return sl, tp
 
-    def _sell(self, res: BTResult, symbol: str, ts, price: float, qty: float,
-              entry_price: float, margin_locked: float, reason: str) -> BTTrade:
+    def _sell(
+        self,
+        res: BTResult,
+        symbol: str,
+        ts,
+        price: float,
+        qty: float,
+        entry_price: float,
+        margin_locked: float,
+        reason: str,
+    ) -> BTTrade:
         fill_price = price * (1 - self.slip)
         gross = qty * fill_price
         fee = gross * self.fee_rate
@@ -321,15 +373,18 @@ class Backtester:
         res.n_trades = len(sells)
         # wins: SELL proceeds vs paired BUY cost
         wins = 0
-        win_pnls: List[float] = []
-        loss_pnls: List[float] = []
-        open_buy: Optional[BTTrade] = None
+        win_pnls: list[float] = []
+        loss_pnls: list[float] = []
+        open_buy: BTTrade | None = None
         for t in res.trades:
             if t.side == "BUY":
                 open_buy = t
             elif t.side == "SELL" and open_buy is not None:
-                cost = (open_buy.qty * open_buy.price) if not self.is_futures else (
-                    open_buy.qty * open_buy.price / self.leverage)
+                cost = (
+                    (open_buy.qty * open_buy.price)
+                    if not self.is_futures
+                    else (open_buy.qty * open_buy.price / self.leverage)
+                )
                 pnl = t.proceeds - cost
                 if pnl > 0:
                     wins += 1
@@ -345,7 +400,8 @@ class Backtester:
                     open_buy = t
                 elif t.side == "SELL" and open_buy is not None:
                     (win_pnls if t.price > open_buy.price else loss_pnls).append(
-                        abs(t.price - open_buy.price) * t.qty)
+                        abs(t.price - open_buy.price) * t.qty
+                    )
                     open_buy = None
             wins = len(win_pnls)
         res.n_wins = wins
@@ -354,6 +410,7 @@ class Backtester:
         res.avg_loss = sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0.0
         res.profit_factor = profit_factor(res.gross_profit, res.gross_loss)
         from .metrics import expectancy as exp_fn
+
         res.expectancy = exp_fn(res.win_rate, res.avg_win, res.avg_loss)
         if res.equity_curve:
             res.max_drawdown_pct = md_fn(res.equity_curve)

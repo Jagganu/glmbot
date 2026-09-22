@@ -1,4 +1,5 @@
 """Allow `python -m glmbot` as an alias for `python bot.py`."""
+
 from __future__ import annotations
 
 import sys

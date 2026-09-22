@@ -1,8 +1,8 @@
 """Unit tests: indicators, strategies, risk, storage, paper broker, backtest.
 Pure-Python (no numpy/pandas) — matches Termux runtime."""
+
 from __future__ import annotations
 
-import math
 import os
 import random
 import sys
@@ -24,18 +24,30 @@ from glmbot.strategies import BUY, SELL, build_strategies  # noqa: E402
 
 def make_cfg(mode="paper", strategies=None):
     return BotConfig(
-        api_key="k", api_secret="s", testnet=True, mode=mode,
-        market="spot", leverage=1,
-        quote_asset="USDT", update_interval_sec=60,
+        api_key="k",
+        api_secret="s",
+        testnet=True,
+        mode=mode,
+        market="spot",
+        leverage=1,
+        quote_asset="USDT",
+        update_interval_sec=60,
         strategies=strategies or ["ema_cross"],
         strategy_params={},
         risk=RiskCfg(
-            quote_budget=1000.0, per_trade_pct=10.0, max_open_positions=3,
-            stop_loss_pct=2.0, take_profit_pct=4.0, trailing_stop_pct=1.5,
+            quote_budget=1000.0,
+            per_trade_pct=10.0,
+            max_open_positions=3,
+            stop_loss_pct=2.0,
+            take_profit_pct=4.0,
+            trailing_stop_pct=1.5,
             cooldown_min=0,
         ),
-        symbols=["BTCUSDT"], sqlite_path=":memory-test:",
-        klines_cache_dir="data/cache", telegram={}, webhook={},
+        symbols=["BTCUSDT"],
+        sqlite_path=":memory-test:",
+        klines_cache_dir="data/cache",
+        telegram={},
+        webhook={},
     )
 
 
@@ -85,15 +97,17 @@ class TestIndicators(unittest.TestCase):
 
     def test_bollinger(self):
         v = [10.0] * 50
-        u, m, l = bollinger(v, 20, 2.0)
+        u, m, lo = bollinger(v, 20, 2.0)
         self.assertAlmostEqual(m[-1], 10.0)
         self.assertAlmostEqual(u[-1], 10.0)  # zero variance
-        self.assertAlmostEqual(l[-1], 10.0)
+        self.assertAlmostEqual(lo[-1], 10.0)
 
     def test_atr_constant_range_is_zero(self):
         n = 40
         k = Klines.from_lists(
-            close=[100.0] * n, high=[101.0] * n, low=[99.0] * n,
+            close=[100.0] * n,
+            high=[101.0] * n,
+            low=[99.0] * n,
         )
         from glmbot.indicators import atr as atr_fn
 
@@ -118,7 +132,7 @@ class TestKlines(unittest.TestCase):
         b = Klines.from_lists(close=[2.0, 3.0])
         c = Klines.concat(a, b)
         self.assertEqual(len(c), 4)
-        d = c.drop_duplicates_by_time()
+        c.drop_duplicates_by_time()
         self.assertEqual(len(c), 4)  # times differ -> unchanged
         e = Klines.concat(a, a)
         f = e.drop_duplicates_by_time()
@@ -138,8 +152,7 @@ class TestStrategies(unittest.TestCase):
 
     def test_ema_cross_buys_on_golden_cross(self):
         # falling then rising -> golden cross
-        closes = [100 - i * (10 / 29) for i in range(30)] + \
-                 [90 + i * (20 / 14) for i in range(15)]
+        closes = [100 - i * (10 / 29) for i in range(30)] + [90 + i * (20 / 14) for i in range(15)]
         strat = build_strategies(["ema_cross"], {})[0]
         sig = strat.evaluate("BTCUSDT", self._df(closes))
         self.assertIn(sig.side, (BUY, "HOLD"))
@@ -198,10 +211,17 @@ class TestRiskManager(unittest.TestCase):
     def test_stop_loss_triggers(self):
         with tempfile.TemporaryDirectory() as tmp:
             rm, store = self._rm(tmp)
-            pid = store.open_position({
-                "symbol": "BTCUSDT", "strategy": "ema_cross", "entry_price": 100.0,
-                "qty": 1.0, "stop_loss": 98.0, "take_profit": 104.0, "mode": "paper",
-            })
+            pid = store.open_position(
+                {
+                    "symbol": "BTCUSDT",
+                    "strategy": "ema_cross",
+                    "entry_price": 100.0,
+                    "qty": 1.0,
+                    "stop_loss": 98.0,
+                    "take_profit": 104.0,
+                    "mode": "paper",
+                }
+            )
             pos = store.get_open_position("BTCUSDT", "paper")
             plan = rm.check_exit(pos, 97.5)
             self.assertEqual(plan.action, "exit")
@@ -211,10 +231,17 @@ class TestRiskManager(unittest.TestCase):
     def test_take_profit_triggers(self):
         with tempfile.TemporaryDirectory() as tmp:
             rm, store = self._rm(tmp)
-            store.open_position({
-                "symbol": "BTCUSDT", "strategy": "ema_cross", "entry_price": 100.0,
-                "qty": 1.0, "stop_loss": 98.0, "take_profit": 104.0, "mode": "paper",
-            })
+            store.open_position(
+                {
+                    "symbol": "BTCUSDT",
+                    "strategy": "ema_cross",
+                    "entry_price": 100.0,
+                    "qty": 1.0,
+                    "stop_loss": 98.0,
+                    "take_profit": 104.0,
+                    "mode": "paper",
+                }
+            )
             pos = store.get_open_position("BTCUSDT", "paper")
             plan = rm.check_exit(pos, 104.5)
             self.assertEqual(plan.action, "exit")
@@ -223,10 +250,17 @@ class TestRiskManager(unittest.TestCase):
     def test_trailing_stop_ratchets_up(self):
         with tempfile.TemporaryDirectory() as tmp:
             rm, store = self._rm(tmp)
-            store.open_position({
-                "symbol": "BTCUSDT", "strategy": "ema_cross", "entry_price": 100.0,
-                "qty": 1.0, "stop_loss": 98.0, "take_profit": 110.0, "mode": "paper",
-            })
+            store.open_position(
+                {
+                    "symbol": "BTCUSDT",
+                    "strategy": "ema_cross",
+                    "entry_price": 100.0,
+                    "qty": 1.0,
+                    "stop_loss": 98.0,
+                    "take_profit": 110.0,
+                    "mode": "paper",
+                }
+            )
             pos = store.get_open_position("BTCUSDT", "paper")
             plan = rm.check_exit(pos, 105.0)  # raise trail high
             self.assertEqual(plan.action, "hold")
@@ -244,10 +278,15 @@ class TestRiskManager(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             rm, store = self._rm(tmp)
             for s in ("AAA", "BBB", "CCC"):
-                store.open_position({
-                    "symbol": s, "strategy": "x", "entry_price": 1.0, "qty": 1.0,
-                    "mode": "paper",
-                })
+                store.open_position(
+                    {
+                        "symbol": s,
+                        "strategy": "x",
+                        "entry_price": 1.0,
+                        "qty": 1.0,
+                        "mode": "paper",
+                    }
+                )
             ok, why = rm.can_open("DDD", "paper")
             self.assertFalse(ok)
             self.assertIn("max_open_positions", why)
@@ -259,18 +298,33 @@ class TestStorage(unittest.TestCase):
             store = Store(os.path.join(tmp, "t.db"))
             store.set_paper_state(1234.5)
             self.assertAlmostEqual(store.get_paper_state(0), 1234.5)
-            tid = store.insert_trade({
-                "ts": utcnow(), "mode": "paper", "symbol": "BTCUSDT", "side": "BUY",
-                "qty": 0.001, "price": 50000.0, "quote_amt": 50.0, "fee": 0.05,
-                "reason": "test", "exchange_order_id": "", "raw": "",
-            })
+            tid = store.insert_trade(
+                {
+                    "ts": utcnow(),
+                    "mode": "paper",
+                    "symbol": "BTCUSDT",
+                    "side": "BUY",
+                    "qty": 0.001,
+                    "price": 50000.0,
+                    "quote_amt": 50.0,
+                    "fee": 0.05,
+                    "reason": "test",
+                    "exchange_order_id": "",
+                    "raw": "",
+                }
+            )
             self.assertEqual(tid, 1)
             trades = store.trades(mode="paper")
             self.assertEqual(len(trades), 1)
-            store.open_position({
-                "symbol": "BTCUSDT", "strategy": "s", "entry_price": 50000,
-                "qty": 0.001, "mode": "paper",
-            })
+            store.open_position(
+                {
+                    "symbol": "BTCUSDT",
+                    "strategy": "s",
+                    "entry_price": 50000,
+                    "qty": 0.001,
+                    "mode": "paper",
+                }
+            )
             self.assertIsNotNone(store.get_open_position("BTCUSDT", "paper"))
             store.snapshot_equity("paper", 950.0, 50.0)
             hist = store.equity_history("paper")
@@ -285,7 +339,7 @@ class TestPaperBroker(unittest.TestCase):
         # spot-like: notional + fee charged from cash
         self.assertAlmostEqual(b.cash, 900.0 - 100.0 * TAKER_FEE, places=8)
         self.assertAlmostEqual(fill["qty"], 100.0 / 50000.0, places=10)
-        sell = b.sell_market("BTCUSDT", fill["qty"], 51000.0)
+        b.sell_market("BTCUSDT", fill["qty"], 51000.0)
         expected = fill["qty"] * 51000.0 * (1 - TAKER_FEE)
         self.assertAlmostEqual(b.cash, 900.0 - 100.0 * TAKER_FEE + expected, places=8)
 
@@ -297,8 +351,10 @@ class TestPaperBroker(unittest.TestCase):
         self.assertAlmostEqual(b.cash, 1000.0 - 100.0 - 200.0 * FUT_TAKER_FEE, places=8)
         self.assertAlmostEqual(fill["qty"], 200.0 / 50000.0, places=10)
         # price +5% -> notional 210, margin returned 100 + pnl 10 - fee
-        sell = b.sell_market("BTCUSDT", fill["qty"], 52500.0, entry_price=50000.0)
-        expected_cash = 1000.0 - 100.0 - 200.0 * FUT_TAKER_FEE + 100.0 + 10.0 - 210.0 * FUT_TAKER_FEE
+        b.sell_market("BTCUSDT", fill["qty"], 52500.0, entry_price=50000.0)
+        expected_cash = (
+            1000.0 - 100.0 - 200.0 * FUT_TAKER_FEE + 100.0 + 10.0 - 210.0 * FUT_TAKER_FEE
+        )
         self.assertAlmostEqual(b.cash, expected_cash, places=8)
 
     def test_insufficient_cash(self):
@@ -311,17 +367,24 @@ class TestPaperBroker(unittest.TestCase):
 class TestSymbolFilter(unittest.TestCase):
     def test_filters(self):
         info = {
-            "symbol": "BTCUSDT", "status": "TRADING", "baseAsset": "BTC",
+            "symbol": "BTCUSDT",
+            "status": "TRADING",
+            "baseAsset": "BTC",
             "quoteAsset": "USDT",
             "filters": [
-                {"filterType": "LOT_SIZE", "minQty": "0.00001", "maxQty": "1000",
-                 "stepSize": "0.00001"},
+                {
+                    "filterType": "LOT_SIZE",
+                    "minQty": "0.00001",
+                    "maxQty": "1000",
+                    "stepSize": "0.00001",
+                },
                 {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
                 {"filterType": "NOTIONAL", "minNotional": "10"},
             ],
         }
         f = SymbolFilter(info)
         from decimal import Decimal
+
         self.assertEqual(f.round_qty(Decimal("0.123456")), Decimal("0.12345"))
         # round_price uses ROUND_HALF_UP to nearest tick
         self.assertEqual(f.round_price(Decimal("50000.567")), Decimal("50000.57"))
@@ -375,7 +438,7 @@ class TestATRStops(unittest.TestCase):
             store = Store(os.path.join(tmp, "t.db"))
             rm = RiskManager(cfg.risk, store)
             lv = rm.entry_levels(100.0, atr=None)
-            self.assertAlmostEqual(lv["stop_loss"], 98.0)   # 2% fixed
+            self.assertAlmostEqual(lv["stop_loss"], 98.0)  # 2% fixed
             self.assertAlmostEqual(lv["take_profit"], 104.0)  # 4% fixed
 
     def test_fixed_pct_levels_by_default(self):
@@ -398,7 +461,7 @@ class TestDailyLossCap(unittest.TestCase):
             # baseline snapshot: 1000
             store.snapshot_equity("paper", 1000.0, 0.0)
             self.assertFalse(rm.check_daily_loss("paper", 980.0))  # -2% ok
-            self.assertTrue(rm.check_daily_loss("paper", 940.0))   # -6% trips
+            self.assertTrue(rm.check_daily_loss("paper", 940.0))  # -6% trips
             # kill switch now blocks entries
             ok, why = rm.can_open("BTCUSDT", "paper")
             self.assertFalse(ok)

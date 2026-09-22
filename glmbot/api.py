@@ -12,6 +12,7 @@ Hardened for production use:
 Public surface used by the rest of the bot (stable):
   BinanceClient, BinanceError, SymbolFilter, RateLimiter
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -23,7 +24,7 @@ import threading
 import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 from urllib.parse import urlencode
 
 import requests
@@ -72,7 +73,7 @@ class RateLimiter:
     def __init__(self, max_per_minute: int = 1000):
         self.max = max_per_minute
         self.lock = threading.Lock()
-        self.hits: List[float] = []
+        self.hits: list[float] = []
 
     def acquire(self) -> None:
         while True:
@@ -91,7 +92,7 @@ class SymbolFilter:
     Works for both spot and futures ``exchangeInfo`` payloads.
     """
 
-    def __init__(self, info: Dict[str, Any]):
+    def __init__(self, info: dict[str, Any]):
         f = {flt.get("filterType"): flt for flt in info.get("filters", [])}
         lot = f.get("LOT_SIZE", {})
         mlot = f.get("MARKET_LOT_SIZE", lot)
@@ -133,8 +134,7 @@ class SymbolFilter:
         ticks = (price / self.tick_size).to_integral_value(rounding="ROUND_HALF_UP")
         return ticks * self.tick_size
 
-    def clamp_qty(self, qty: Decimal, price: Decimal,
-                  market_order: bool = True) -> Optional[Decimal]:
+    def clamp_qty(self, qty: Decimal, price: Decimal, market_order: bool = True) -> Decimal | None:
         """Return qty adjusted to exchange filters, or None if untradable."""
         if self.status != "TRADING":
             return None
@@ -171,11 +171,17 @@ class BinanceClient:
         cache_dir: on-disk ``exchangeInfo`` cache directory.
     """
 
-    def __init__(self, api_key: str, api_secret: str, testnet: bool = True,
-                 market: str = "spot", timeout: int = 15,
-                 session: Optional[requests.Session] = None,
-                 data_market: Optional[str] = None,
-                 cache_dir: str = "data/cache"):
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        testnet: bool = True,
+        market: str = "spot",
+        timeout: int = 15,
+        session: requests.Session | None = None,
+        data_market: str | None = None,
+        cache_dir: str = "data/cache",
+    ):
         self.api_key = api_key or ""
         self.api_secret = api_secret or ""
         self.testnet = bool(testnet)
@@ -203,25 +209,25 @@ class BinanceClient:
             self.using_mainnet_data = True
         else:
             self.using_mainnet_data = self.market != "futures" or not self.testnet
-        self._exec_filters: Dict[str, SymbolFilter] = {}
+        self._exec_filters: dict[str, SymbolFilter] = {}
         self.timeout = timeout
         self.cache_dir = Path(cache_dir)
         self.limiter = RateLimiter()
         self.s = session or requests.Session()
         self.s.headers["User-Agent"] = USER_AGENT
-        self._filters: Dict[str, SymbolFilter] = {}
+        self._filters: dict[str, SymbolFilter] = {}
         self._server_time_offset = 0
         if self.api_key:
             self.s.headers["X-MBX-APIKEY"] = self.api_key
 
     # ---------------- internals ----------------
     def _sleep_backoff(self, attempt: int) -> None:
-        wait = min(2 ** attempt, 30) + random.uniform(0, 0.5)
+        wait = min(2**attempt, 30) + random.uniform(0, 0.5)
         log.warning("retry %d/5 in %.1fs", attempt + 1, wait)
         time.sleep(wait)
 
     def _retry(self, fn, *a, **kw):
-        last: Optional[Exception] = None
+        last: Exception | None = None
         for attempt in range(5):
             try:
                 return fn(*a, **kw)
@@ -242,8 +248,14 @@ class BinanceClient:
                 break
         raise BinanceError(0, 0, f"retries exhausted: {last}")
 
-    def _request(self, base: str, path: str, params: Optional[Dict[str, Any]] = None,
-                 signed: bool = False, method: str = "GET") -> Any:
+    def _request(
+        self,
+        base: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+        signed: bool = False,
+        method: str = "GET",
+    ) -> Any:
         self.limiter.acquire()
         params = dict(params or {})
         url = f"{base}{path}"
@@ -254,16 +266,16 @@ class BinanceClient:
                 params["timestamp"] = int(time.time() * 1000) + self._server_time_offset
                 params["recvWindow"] = 10000
                 qs = urlencode(params, doseq=True)
-                sig = hmac.new(
-                    self.api_secret.encode(), qs.encode(), hashlib.sha256
-                ).hexdigest()
+                sig = hmac.new(self.api_secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
                 qs = f"{qs}&signature={sig}"
                 if method == "GET":
                     r = self.s.get(f"{url}?{qs}", timeout=self.timeout)
                 else:
                     r = self.s.post(
-                        url, headers={"Content-Type": "application/x-www-form-urlencoded"},
-                        data=qs, timeout=self.timeout,
+                        url,
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        data=qs,
+                        timeout=self.timeout,
                     )
             else:
                 if method == "GET":
@@ -296,10 +308,10 @@ class BinanceClient:
         except Exception:
             return r.text
 
-    def _sget(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    def _sget(self, path: str, params: dict[str, Any] | None = None) -> Any:
         return self._retry(self._request, self.base, path, params, True, "GET")
 
-    def _spost(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    def _spost(self, path: str, params: dict[str, Any] | None = None) -> Any:
         return self._retry(self._request, self.base, path, params, True, "POST")
 
     # ---------------- time ----------------
@@ -329,7 +341,7 @@ class BinanceClient:
         safe = f"{self.market}-{'testnet' if self.testnet else 'main'}-{name}.json"
         return self.cache_dir / safe
 
-    def _read_cache(self, name: str, ttl_sec: int = 86_400) -> Optional[Any]:
+    def _read_cache(self, name: str, ttl_sec: int = 86_400) -> Any | None:
         try:
             p = self._cache_path(name)
             if not p.exists():
@@ -348,7 +360,7 @@ class BinanceClient:
             pass
 
     # ---------------- public market data ----------------
-    def exchange_filters(self) -> Dict[str, SymbolFilter]:
+    def exchange_filters(self) -> dict[str, SymbolFilter]:
         """USDT data-market filters (for decisions + spot sizing). Cached."""
         if self._filters:
             return self._filters
@@ -359,7 +371,7 @@ class BinanceClient:
         j = cached if cached is not None else self._retry(self._request, base, path)
         if cached is None:
             self._write_cache(cache_key, j)
-        for s in (j.get("symbols", []) if isinstance(j, dict) else []):
+        for s in j.get("symbols", []) if isinstance(j, dict) else []:
             if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING":
                 try:
                     self._filters[s["symbol"]] = SymbolFilter(s)
@@ -374,10 +386,14 @@ class BinanceClient:
         if not self._exec_filters:
             cache_key = "exec-filters"
             cached = self._read_cache(cache_key)
-            j = cached if cached is not None else self._retry(self._request, self.base, self.info_path)
+            j = (
+                cached
+                if cached is not None
+                else self._retry(self._request, self.base, self.info_path)
+            )
             if cached is None:
                 self._write_cache(cache_key, j)
-            for s in (j.get("symbols", []) if isinstance(j, dict) else []):
+            for s in j.get("symbols", []) if isinstance(j, dict) else []:
                 if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING":
                     try:
                         self._exec_filters[s["symbol"]] = SymbolFilter(s)
@@ -389,16 +405,19 @@ class BinanceClient:
         return "spot" if self.using_mainnet_data else self.market
 
     @staticmethod
-    def _lookup_filter(filters: Dict[str, SymbolFilter], symbol: str) -> SymbolFilter:
+    def _lookup_filter(filters: dict[str, SymbolFilter], symbol: str) -> SymbolFilter:
         if symbol not in filters:
-            raise BinanceError(0, 0, f"no USDT filter for {symbol} (delisted or wrong quote asset?)")
+            raise BinanceError(
+                0, 0, f"no USDT filter for {symbol} (delisted or wrong quote asset?)"
+            )
         return filters[symbol]
 
-    def klines(self, symbol: str, interval: str = "15m", limit: int = 300,
-               end_time: Optional[int] = None) -> List[dict]:
+    def klines(
+        self, symbol: str, interval: str = "15m", limit: int = 300, end_time: int | None = None
+    ) -> list[dict]:
         if not 1 <= limit <= 1000:
             raise ValueError("klines limit must be 1..1000")
-        params: Dict[str, Any] = {"symbol": symbol, "interval": interval, "limit": limit}
+        params: dict[str, Any] = {"symbol": symbol, "interval": interval, "limit": limit}
         if end_time is not None:
             params["endTime"] = end_time
         base = self.data_base if self.using_mainnet_data else self.base
@@ -407,12 +426,17 @@ class BinanceClient:
         out = []
         for k in j:
             try:
-                out.append({
-                    "open_time": int(k[0]),
-                    "open": float(k[1]), "high": float(k[2]),
-                    "low": float(k[3]), "close": float(k[4]),
-                    "volume": float(k[5]), "close_time": int(k[6]),
-                })
+                out.append(
+                    {
+                        "open_time": int(k[0]),
+                        "open": float(k[1]),
+                        "high": float(k[2]),
+                        "low": float(k[3]),
+                        "close": float(k[4]),
+                        "volume": float(k[5]),
+                        "close_time": int(k[6]),
+                    }
+                )
             except (IndexError, ValueError, TypeError):
                 continue
         return out
@@ -421,12 +445,12 @@ class BinanceClient:
         prices = self.ticker_prices([symbol])
         return prices[symbol]
 
-    def ticker_prices(self, symbols: List[str]) -> Dict[str, float]:
+    def ticker_prices(self, symbols: list[str]) -> dict[str, float]:
         """Batch price fetch (one HTTP call for N symbols)."""
         base = self.data_base if self.using_mainnet_data else self.base
         path = self.data_price_path if self.using_mainnet_data else self.price_path
         j = self._retry(self._request, base, path, {"symbols": json_dumps(symbols)})
-        out: Dict[str, float] = {}
+        out: dict[str, float] = {}
         if isinstance(j, dict):  # single-symbol response shape
             j = [j]
         for row in j:
@@ -440,23 +464,28 @@ class BinanceClient:
         return out
 
     # ---------------- account (signed) ----------------
-    def account(self) -> Dict[str, Any]:
+    def account(self) -> dict[str, Any]:
         return self._sget(self.account_path)
 
-    def spot_balances(self) -> Dict[str, float]:
+    def spot_balances(self) -> dict[str, float]:
         acct = self.account()
         return {b.get("asset", ""): float(b.get("free", 0) or 0) for b in acct.get("balances", [])}
 
     # ---------------- orders (signed, POST) ----------------
-    def get_order(self, symbol: str, order_id: int) -> Dict[str, Any]:
+    def get_order(self, symbol: str, order_id: int) -> dict[str, Any]:
         return self._sget(self.order_path, {"symbol": symbol, "orderId": order_id})
 
-    def place_order(self, symbol: str, side: str, order_type: str = "MARKET",
-                    quantity: Optional[str] = None,
-                    quote_order_qty: Optional[str] = None,
-                    reduce_only: bool = False,
-                    extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        params: Dict[str, Any] = {"symbol": symbol, "side": side, "type": order_type}
+    def place_order(
+        self,
+        symbol: str,
+        side: str,
+        order_type: str = "MARKET",
+        quantity: str | None = None,
+        quote_order_qty: str | None = None,
+        reduce_only: bool = False,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"symbol": symbol, "side": side, "type": order_type}
         if quantity:
             params["quantity"] = quantity
         if quote_order_qty:
@@ -473,7 +502,9 @@ class BinanceClient:
                 try:
                     chk = self.get_order(symbol, oid)
                     if float(chk.get("executedQty", 0) or 0) > 0 and chk.get("status") in (
-                        "FILLED", "PARTIALLY_FILLED"):
+                        "FILLED",
+                        "PARTIALLY_FILLED",
+                    ):
                         return chk
                     if chk.get("status") == "FILLED":
                         return chk
@@ -486,7 +517,7 @@ class BinanceClient:
         if self.market != "futures":
             raise BinanceError(0, 0, f"{what} is futures-only (client market={self.market})")
 
-    def set_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
+    def set_leverage(self, symbol: str, leverage: int) -> dict[str, Any]:
         self._require_futures("set_leverage")
         return self._spost("/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage})
 
@@ -502,12 +533,12 @@ class BinanceClient:
                 return {"msg": "unchanged"}
             raise
 
-    def futures_position_risk(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+    def futures_position_risk(self, symbol: str | None = None) -> list[dict[str, Any]]:
         self._require_futures("futures_position_risk")
         params = {"symbol": symbol} if symbol else {}
         return self._sget("/fapi/v2/positionRisk", params)
 
-    def futures_balance(self) -> Dict[str, Any]:
+    def futures_balance(self) -> dict[str, Any]:
         """USDT-M futures wallet as {'free','total'} in USDT."""
         self._require_futures("futures_balance")
         acct = self.account()

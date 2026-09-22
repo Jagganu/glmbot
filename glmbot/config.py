@@ -11,13 +11,14 @@ Validation raises :class:`ConfigError` with *actionable* messages - every
 message tells the operator exactly which key to fix and what valid looks
 like. Public dataclass fields are backward compatible with v1.0 configs.
 """
+
 from __future__ import annotations
 
 import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import yaml
 
@@ -35,9 +36,11 @@ class ConfigError(Exception):
 def _expand_env(value: Any) -> Any:
     """Recursively expand ${VAR} / ${VAR:-default} in strings."""
     if isinstance(value, str):
+
         def _sub(m: re.Match) -> str:
             name, default = m.group(1), m.group(2)
             return os.environ.get(name, default if default is not None else m.group(0))
+
         return _ENV_PATTERN.sub(_sub, value)
     if isinstance(value, dict):
         return {k: _expand_env(v) for k, v in value.items()}
@@ -49,6 +52,7 @@ def _expand_env(value: Any) -> Any:
 # ---------------------------------------------------------------------------
 # Risk config
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class RiskCfg:
@@ -74,13 +78,13 @@ class RiskCfg:
     atr_sl_mult: float = 2.0
     atr_tp_mult: float = 3.0
     daily_loss_cap_pct: float = 0.0  # 0 = disabled; e.g. 5 = halt after -5% day
-    min_votes: int = 0               # 0 = unanimous consensus
-    max_daily_trades: int = 0        # 0 = unlimited
+    min_votes: int = 0  # 0 = unanimous consensus
+    max_daily_trades: int = 0  # 0 = unlimited
     max_symbol_positions: int = 1
     slippage_bps: float = 0.0
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "RiskCfg":
+    def from_dict(cls, d: dict[str, Any]) -> RiskCfg:
         try:
             return cls(
                 quote_budget=float(d["quote_budget"]),
@@ -105,9 +109,9 @@ class RiskCfg:
         except (TypeError, ValueError) as e:
             raise ConfigError(f"risk section has invalid value: {e}") from e
 
-    def validate(self) -> List[str]:
-        errs: List[str] = []
-        if not 0 < self.quote_budget:
+    def validate(self) -> list[str]:
+        errs: list[str] = []
+        if not self.quote_budget > 0:
             errs.append("risk.quote_budget must be > 0")
         if not 0 < self.per_trade_pct <= 100:
             errs.append("risk.per_trade_pct must be in (0, 100]")
@@ -138,6 +142,7 @@ class RiskCfg:
 # Bot config
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class BotConfig:
     """Top-level bot configuration (one YAML document)."""
@@ -150,20 +155,22 @@ class BotConfig:
     leverage: int
     quote_asset: str
     update_interval_sec: int
-    strategies: List[str]
-    strategy_params: Dict[str, Dict[str, Any]]
+    strategies: list[str]
+    strategy_params: dict[str, dict[str, Any]]
     risk: RiskCfg
-    symbols: List[str]
+    symbols: list[str]
     sqlite_path: str
     klines_cache_dir: str
-    telegram: Dict[str, Any] = field(default_factory=dict)
-    webhook: Dict[str, Any] = field(default_factory=dict)
-    config_path: Optional[str] = None
+    telegram: dict[str, Any] = field(default_factory=dict)
+    webhook: dict[str, Any] = field(default_factory=dict)
+    config_path: str | None = None
 
     @property
     def base_url(self) -> str:
         if self.market == "futures":
-            return "https://testnet.binancefuture.com" if self.testnet else "https://fapi.binance.com"
+            return (
+                "https://testnet.binancefuture.com" if self.testnet else "https://fapi.binance.com"
+            )
         if self.testnet:
             return "https://testnet.binance.vision"
         return "https://api.binance.com"
@@ -174,11 +181,13 @@ class BotConfig:
         return f"{self.mode.upper()} | {self.market.upper()} | {net}"
 
     def validate(self) -> None:
-        errs: List[str] = []
+        errs: list[str] = []
         if self.mode not in ("paper", "live"):
             errs.append("trading.mode must be 'paper' or 'live'")
         if self.mode == "live" and (not self.api_key or self.api_key.startswith("YOUR_")):
-            errs.append("api.key not set (required for live mode) - paste a key or switch trading.mode to 'paper'")
+            errs.append(
+                "api.key not set (required for live mode) - paste a key or switch trading.mode to 'paper'"
+            )
         if self.market not in ("spot", "futures"):
             errs.append("trading.trade_type must be 'spot' or 'futures'")
         if self.market == "futures" and not 1 <= self.leverage <= 20:
@@ -213,7 +222,7 @@ class BotConfig:
             f"strategies={self.strategies} key={key} config={self.config_path})"
         )
 
-    def summary(self) -> Dict[str, Any]:
+    def summary(self) -> dict[str, Any]:
         """Safe (secret-free) dict for `doctor` / `--json` output."""
         return {
             "version": __version__,

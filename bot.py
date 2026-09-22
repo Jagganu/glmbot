@@ -29,9 +29,11 @@ Commands:
 Global flags: -c PATH (config), -v (debug logs), --json (machine output),
   --no-color (plain output), --log-file PATH (file logging).
 """
+
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import shutil
 import sys
@@ -39,14 +41,21 @@ import time
 from pathlib import Path
 
 from glmbot import __version__
-from glmbot.ui import HAS_RICH, Table, banner, console as _get_console, status_line
+from glmbot.ui import HAS_RICH, Table, banner, status_line
+from glmbot.ui import console as _get_console
 
 console = _get_console()
+
+
+def _print_json(data: object, **_ignored: object) -> None:
+    """Machine output via builtin print: Rich would word-wrap and corrupt JSON."""
+    print(json.dumps(data, indent=2, default=str))
 
 
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
+
 
 def setup_logging(verbose: bool, log_file: str | None = None) -> None:
     from glmbot.logging_setup import setup_logging as _setup
@@ -56,7 +65,7 @@ def setup_logging(verbose: bool, log_file: str | None = None) -> None:
 
 def _emit(data: dict, as_json: bool) -> None:
     if as_json:
-        console.print(json.dumps(data, indent=2, default=str))
+        _print_json(data)
     # callers print human tables when not json
 
 
@@ -67,7 +76,7 @@ def _load(args):
         return load_config(args.config)
     except ConfigError as e:
         if getattr(args, "json", False):
-            console.print(json.dumps({"ok": False, "error": str(e)}))
+            _print_json({"ok": False, "error": str(e)})
         else:
             console.print(f"[red]config error:[/red] {e}")
             console.print("[dim]hint: run `bot.py validate` or `bot.py init --force`[/dim]")
@@ -77,8 +86,7 @@ def _load(args):
 def _client(cfg):
     from glmbot.api import BinanceClient
 
-    return BinanceClient(cfg.api_key, cfg.api_secret, testnet=cfg.testnet,
-                         market=cfg.market)
+    return BinanceClient(cfg.api_key, cfg.api_secret, testnet=cfg.testnet, market=cfg.market)
 
 
 def _need_rich_note() -> None:
@@ -90,6 +98,7 @@ def _need_rich_note() -> None:
 # commands
 # --------------------------------------------------------------------------
 
+
 def cmd_init(args) -> int:
     dest = Path(args.config or "config.yml")
     if dest.exists() and not args.force:
@@ -98,10 +107,13 @@ def cmd_init(args) -> int:
     shutil.copy("config.example.yml", dest)
     try:
         import os
+
         os.chmod(dest, 0o600)
     except Exception:
         pass
-    console.print(f"[green]OK created {dest}[/green] - edit api.key/api.secret, then run `bot.py doctor`")
+    console.print(
+        f"[green]OK created {dest}[/green] - edit api.key/api.secret, then run `bot.py doctor`"
+    )
     return 0
 
 
@@ -115,7 +127,7 @@ def cmd_validate(args) -> int:
     except ConfigError as e:
         msg = f"invalid: {e}"
         if args.json:
-            console.print(json.dumps({"ok": False, "error": str(e)}))
+            _print_json({"ok": False, "error": str(e)})
         else:
             console.print(f"[red]FAIL {path}: {msg}[/red]")
         return 1
@@ -123,21 +135,22 @@ def cmd_validate(args) -> int:
         strats = build_strategies(cfg.strategies, cfg.strategy_params)
     except ValueError as e:
         if args.json:
-            console.print(json.dumps({"ok": False, "error": str(e)}))
+            _print_json({"ok": False, "error": str(e)})
         else:
             console.print(f"[red]FAIL strategies: {e}[/red]")
         return 1
-    data = {"ok": True, "config": cfg.summary(),
-            "strategies": [s.name for s in strats]}
+    data = {"ok": True, "config": cfg.summary(), "strategies": [s.name for s in strats]}
     if args.json:
-        console.print(json.dumps(data, indent=2))
+        _print_json(data)
     else:
         console.print(f"[green]OK {path} valid[/green] - {cfg.env_label}")
         console.print(f"  symbols: {', '.join(cfg.symbols)}")
         console.print(f"  strategies: {', '.join(s.name for s in strats)}")
-        console.print(f"  risk: {cfg.risk.per_trade_pct}%/trade | "
-                      f"SL {cfg.risk.stop_loss_pct}% | TP {cfg.risk.take_profit_pct}% | "
-                      f"max {cfg.risk.max_open_positions} positions")
+        console.print(
+            f"  risk: {cfg.risk.per_trade_pct}%/trade | "
+            f"SL {cfg.risk.stop_loss_pct}% | TP {cfg.risk.take_profit_pct}% | "
+            f"max {cfg.risk.max_open_positions} positions"
+        )
     return 0
 
 
@@ -158,10 +171,14 @@ def cmd_version(args) -> int:
                 deps[label] = getattr(__import__(mod), "__version__", "installed")
             except Exception:
                 deps[label] = "installed"
-    data = {"glmbot": __version__, "python": sys.version.split()[0], "deps": deps,
-            "rich_ui": HAS_RICH}
+    data = {
+        "glmbot": __version__,
+        "python": sys.version.split()[0],
+        "deps": deps,
+        "rich_ui": HAS_RICH,
+    }
     if args.json:
-        console.print(json.dumps(data, indent=2))
+        _print_json(data)
     else:
         console.print(banner(__version__))
         console.print(f"Python {data['python']}")
@@ -174,19 +191,23 @@ def cmd_strategies(args) -> int:
     from glmbot.strategies import STRATEGY_CATALOG
 
     if args.json:
-        console.print(json.dumps(
-            [{"name": m.name, "description": m.description, "params": m.params}
-             for m in STRATEGY_CATALOG], indent=2))
+        _print_json(
+            [
+                {"name": m.name, "description": m.description, "params": m.params}
+                for m in STRATEGY_CATALOG
+            ]
+        )
         return 0
     table = Table(title="Available strategies")
     table.add_column("Name", style="cyan")
     table.add_column("Signal logic")
     table.add_column("Parameters", style="dim")
     for m in STRATEGY_CATALOG:
-        table.add_row(m.name, m.description,
-                      ", ".join(f"{k}={v}" for k, v in m.params.items()))
+        table.add_row(m.name, m.description, ", ".join(f"{k}={v}" for k, v in m.params.items()))
     console.print(table)
-    console.print("[dim]enable in config.yml -> strategies.active; tune voting via risk.min_votes[/dim]")
+    console.print(
+        "[dim]enable in config.yml -> strategies.active; tune voting via risk.min_votes[/dim]"
+    )
     return 0
 
 
@@ -200,11 +221,24 @@ def cmd_doctor(args) -> int:
     checks.append((sys.version_info >= (3, 10), "Python >= 3.10", sys.version.split()[0]))
     for mod, label in (("requests", "requests"), ("yaml", "PyYAML")):
         found = importlib.util.find_spec(mod) is not None
-        checks.append((found, f"dependency: {label}", "installed" if found else "MISSING - pip install -r requirements.txt"))
-    checks.append((HAS_RICH, "rich UI (optional)", "installed" if HAS_RICH else "not installed - ASCII fallback"))
+        checks.append(
+            (
+                found,
+                f"dependency: {label}",
+                "installed" if found else "MISSING - pip install -r requirements.txt",
+            )
+        )
+    checks.append(
+        (
+            HAS_RICH,
+            "rich UI (optional)",
+            "installed" if HAS_RICH else "not installed - ASCII fallback",
+        )
+    )
 
     # config
     from glmbot.config import ConfigError, load_config
+
     cfg = None
     try:
         cfg = load_config(args.config)
@@ -216,7 +250,13 @@ def cmd_doctor(args) -> int:
     if cfg is not None:
         client = _client(cfg)
         ping = client.ping()
-        checks.append((ping, f"Binance REST ({client.base})", "reachable" if ping else "UNREACHABLE - check network/VPN"))
+        checks.append(
+            (
+                ping,
+                f"Binance REST ({client.base})",
+                "reachable" if ping else "UNREACHABLE - check network/VPN",
+            )
+        )
         try:
             off = client.sync_time()
             checks.append((abs(off) < 5000, "clock sync", f"offset {off}ms"))
@@ -226,12 +266,18 @@ def cmd_doctor(args) -> int:
             try:
                 if cfg.market == "futures":
                     bal = client.futures_balance()
-                    checks.append((True, "signed request (futures)",
-                                   f"wallet {bal['total']:.2f} USDT (free {bal['free']:.2f})"))
+                    checks.append(
+                        (
+                            True,
+                            "signed request (futures)",
+                            f"wallet {bal['total']:.2f} USDT (free {bal['free']:.2f})",
+                        )
+                    )
                 else:
                     acct = client.account()
-                    checks.append((True, "signed request (spot)",
-                                   f"{len(acct.get('balances', []))} balances"))
+                    checks.append(
+                        (True, "signed request (spot)", f"{len(acct.get('balances', []))} balances")
+                    )
             except Exception as e:
                 checks.append((False, "signed request", str(e)[:160]))
         else:
@@ -244,8 +290,13 @@ def cmd_doctor(args) -> int:
                     client.get_filter(s)
                 except Exception:
                     missing.append(s)
-            checks.append((not missing, "watchlist filters",
-                           "all OK" if not missing else f"missing: {', '.join(missing)}"))
+            checks.append(
+                (
+                    not missing,
+                    "watchlist filters",
+                    "all OK" if not missing else f"missing: {', '.join(missing)}",
+                )
+            )
         except Exception as e:
             checks.append((False, "watchlist filters", str(e)[:120]))
 
@@ -254,11 +305,16 @@ def cmd_doctor(args) -> int:
         if not args.json:
             console.print(status_line(passed, label, detail))
     if args.json:
-        console.print(json.dumps(
-            {"ok": ok, "checks": [{"ok": p, "label": l, "detail": d} for p, l, d in checks]},
-            indent=2))
+        _print_json(
+            {
+                "ok": ok,
+                "checks": [{"ok": p, "label": lbl, "detail": d} for p, lbl, d in checks],
+            }
+        )
     else:
-        console.print("[green]OK healthy[/green]" if ok else "[red]FAIL issues found - see above[/red]")
+        console.print(
+            "[green]OK healthy[/green]" if ok else "[red]FAIL issues found - see above[/red]"
+        )
     return 0 if ok else 1
 
 
@@ -283,11 +339,13 @@ def cmd_price(args) -> int:
         except BinanceError as e:
             rows.append((sym, str(e)[:80], False))
     if args.json:
-        console.print(json.dumps(
-            {"prices": [{"symbol": s, "ok": ok_, "price_or_error": v} for s, v, ok_ in rows]},
-            indent=2))
+        _print_json(
+            {"prices": [{"symbol": s, "ok": ok_, "price_or_error": v} for s, v, ok_ in rows]}
+        )
         return 0
-    table = Table(title=f"Prices | {client.data_base if client.using_mainnet_data else client.base}")
+    table = Table(
+        title=f"Prices | {client.data_base if client.using_mainnet_data else client.base}"
+    )
     table.add_column("Symbol", style="cyan")
     table.add_column("Price", justify="right")
     for s, v, _ in rows:
@@ -308,16 +366,21 @@ def cmd_candles(args) -> int:
         console.print(f"[red]FAIL klines failed:[/red] {e}")
         return 1
     if args.json:
-        console.print(json.dumps({"symbol": sym, "interval": args.interval,
-                                  "candles": kl[-args.rows:]}, indent=2, default=str))
+        _print_json({"symbol": sym, "interval": args.interval, "candles": kl[-args.rows :]})
         return 0
     table = Table(title=f"{sym} {args.interval} (last {args.rows})")
     for col in ("time", "open", "high", "low", "close", "volume"):
         table.add_column(col, justify="right")
-    for k in kl[-args.rows:]:
+    for k in kl[-args.rows :]:
         ts = time.strftime("%m-%d %H:%M", time.localtime(k["open_time"] / 1000))
-        table.add_row(ts, f"{k['open']:,.6g}", f"{k['high']:,.6g}", f"{k['low']:,.6g}",
-                      f"{k['close']:,.6g}", f"{k['volume']:,.4g}")
+        table.add_row(
+            ts,
+            f"{k['open']:,.6g}",
+            f"{k['high']:,.6g}",
+            f"{k['low']:,.6g}",
+            f"{k['close']:,.6g}",
+            f"{k['volume']:,.4g}",
+        )
     console.print(table)
     return 0
 
@@ -333,7 +396,7 @@ def cmd_test_connection(args) -> int:
         console.print(status_line(ok, "Binance REST reachable", client.base))
     if not ok:
         if args.json:
-            console.print(json.dumps({"ok": False, **result}))
+            _print_json({"ok": False, **result})
         else:
             console.print("[dim]hint: VPN/firewall/geo-block? try `bot.py doctor`[/dim]")
         return 1
@@ -349,33 +412,39 @@ def cmd_test_connection(args) -> int:
         try:
             if cfg.market == "futures":
                 bal = client.futures_balance()
-                result.update({"signed": True, "wallet_total": bal["total"], "wallet_free": bal["free"]})
+                result.update(
+                    {"signed": True, "wallet_total": bal["total"], "wallet_free": bal["free"]}
+                )
                 if not args.json:
                     console.print(
                         f"[green]OK[/] signed request (FUTURES {'testnet' if cfg.testnet else 'MAINNET'}) "
-                        f"wallet: {bal['total']:.2f} USDT (free {bal['free']:.2f})")
+                        f"wallet: {bal['total']:.2f} USDT (free {bal['free']:.2f})"
+                    )
             else:
                 acct = client.account()
                 result.update({"signed": True, "balances": len(acct.get("balances", []))})
                 if not args.json:
                     console.print(
                         f"[green]OK[/] signed request ({'testnet' if cfg.testnet else 'MAINNET'}) "
-                        f"account has {len(acct.get('balances', []))} balances")
+                        f"account has {len(acct.get('balances', []))} balances"
+                    )
         except Exception as e:
             result["signed"] = False
             result["error"] = str(e)[:300]
             if args.json:
-                console.print(json.dumps({"ok": False, **result}))
+                _print_json({"ok": False, **result})
             else:
                 console.print(f"[red]FAIL signed request:[/red] {e}")
-                console.print("[dim]hint: wrong env (spot vs futures testnet), IP whitelist, or expired demo keys[/dim]")
+                console.print(
+                    "[dim]hint: wrong env (spot vs futures testnet), IP whitelist, or expired demo keys[/dim]"
+                )
             return 1
     else:
         result["signed"] = None
         if not args.json:
             console.print("[yellow]no API key set - public endpoints only[/yellow]")
     if args.json:
-        console.print(json.dumps({"ok": True, **result}, indent=2, default=str))
+        _print_json({"ok": True, **result})
     return 0
 
 
@@ -395,8 +464,9 @@ def cmd_backtest(args) -> int:
         all_rows: list = []
         end_time = None
         while len(all_rows) < target:
-            kl = client.klines(sym, "15m", limit=min(1000, target - len(all_rows)),
-                               end_time=end_time)
+            kl = client.klines(
+                sym, "15m", limit=min(1000, target - len(all_rows)), end_time=end_time
+            )
             if not kl:
                 break
             all_rows = kl + all_rows
@@ -412,8 +482,7 @@ def cmd_backtest(args) -> int:
     bt = Backtester(cfg, klines)
     results = bt.run()
     if args.json:
-        console.print(json.dumps(
-            {s: r.to_dict() for s, r in results.items()}, indent=2))
+        _print_json({s: r.to_dict() for s, r in results.items()})
     else:
         show_backtest(results, cfg.risk.quote_budget)
     if args.csv:
@@ -435,20 +504,26 @@ def cmd_run(args) -> int:
         console.print(banner(__version__))
     store = Store(cfg.sqlite_path)
     client = _client(cfg)
-    try:
+    with contextlib.suppress(Exception):
         client.sync_time()
-    except Exception:
-        pass
     notifier = notify_factory(cfg)
     if cfg.mode == "paper":
         cash = store.get_paper_state(cfg.risk.quote_budget)
         broker = PaperBroker(client, cash, leverage=cfg.leverage if cfg.market == "futures" else 1)
         if not args.json:
-            console.print(f"[blue]* PAPER[/] {cfg.env_label} | starting cash: {cash:,.2f} {cfg.quote_asset}")
+            console.print(
+                f"[blue]* PAPER[/] {cfg.env_label} | starting cash: {cash:,.2f} {cfg.quote_asset}"
+            )
     else:
-        broker = FuturesBroker(client, leverage=cfg.leverage) if cfg.market == "futures" else LiveBroker(client)
+        broker = (
+            FuturesBroker(client, leverage=cfg.leverage)
+            if cfg.market == "futures"
+            else LiveBroker(client)
+        )
         if not args.json:
-            console.print(f"[red bold]* LIVE {cfg.market.upper()} - real orders will be placed[/red bold]")
+            console.print(
+                f"[red bold]* LIVE {cfg.market.upper()} - real orders will be placed[/red bold]"
+            )
         if not args.yes:
             confirm = console.input("type LIVE to continue: ")
             if confirm.strip() != "LIVE":
@@ -479,7 +554,7 @@ def cmd_status(args) -> int:
     client = _client(cfg)
     positions = store.open_positions(cfg.mode)
     if args.json:
-        console.print(json.dumps(status_dict(cfg, store, client, positions), indent=2, default=str))
+        _print_json(status_dict(cfg, store, client, positions))
         return 0
     show_status(cfg, store, client, positions)
     hist = store.equity_history(cfg.mode, limit=10)
@@ -496,7 +571,7 @@ def cmd_positions(args) -> int:
     store = Store(cfg.sqlite_path)
     rows = store.open_positions(cfg.mode)
     if args.json:
-        console.print(json.dumps(rows, indent=2, default=str))
+        _print_json(rows)
         return 0
     show_positions(rows)
     return 0
@@ -510,8 +585,7 @@ def cmd_trades(args) -> int:
     store = Store(cfg.sqlite_path)
     rows = store.trades(mode=cfg.mode, limit=args.limit)
     if args.json:
-        console.print(json.dumps({"summary": trades_summary(rows), "trades": rows},
-                                 indent=2, default=str))
+        _print_json({"summary": trades_summary(rows), "trades": rows})
         return 0
     show_trades(rows)
     return 0
@@ -525,8 +599,7 @@ def cmd_equity(args) -> int:
     store = Store(cfg.sqlite_path)
     hist = store.equity_history(cfg.mode, limit=500)
     if args.json:
-        console.print(json.dumps(hist[-args.limit:] if args.limit else hist,
-                                 indent=2, default=str))
+        _print_json(hist[-args.limit :] if args.limit else hist)
         return 0
     show_equity(hist)
     return 0
@@ -539,7 +612,7 @@ def cmd_signals(args) -> int:
     store = Store(cfg.sqlite_path)
     rows = store.recent_signals(args.limit)
     if args.json:
-        console.print(json.dumps(rows, indent=2, default=str))
+        _print_json(rows)
         return 0
     if not rows:
         console.print("[dim]no signals logged yet - run the bot once to generate signals[/dim]")
@@ -551,8 +624,13 @@ def cmd_signals(args) -> int:
         side = r["side"]
         color = "green" if side == "BUY" else "red" if side == "SELL" else "dim"
         table.add_row(
-            (r["ts"] or "")[:19], r["symbol"], r["strategy"],
-            f"[{color}]{side}[/{color}]", f"{r['price']:,.6g}", (r["reason"] or "")[:50])
+            (r["ts"] or "")[:19],
+            r["symbol"],
+            r["strategy"],
+            f"[{color}]{side}[/{color}]",
+            f"{r['price']:,.6g}",
+            (r["reason"] or "")[:50],
+        )
     console.print(table)
     return 0
 
@@ -580,8 +658,10 @@ def cmd_set_mode(args) -> int:
         console.print("[red]could not find trading.mode in config[/red]")
         return 1
     p.write_text(new, encoding="utf-8")
-    console.print(f"[green]OK mode set to {args.mode}[/green]" +
-                  (" - [red bold]LIVE trading enabled, be careful[/]" if args.mode == "live" else ""))
+    console.print(
+        f"[green]OK mode set to {args.mode}[/green]"
+        + (" - [red bold]LIVE trading enabled, be careful[/]" if args.mode == "live" else "")
+    )
     return 0
 
 
@@ -589,9 +669,11 @@ def cmd_set_mode(args) -> int:
 # parser
 # --------------------------------------------------------------------------
 
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="glmbot", description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        prog="glmbot", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("-c", "--config", default=None, help="config file path (or GLMBOT_CONFIG)")
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     parser.add_argument("--json", action="store_true", help="machine-readable JSON output")
@@ -699,6 +781,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(_hoist_global_flags(sys.argv[1:] if argv is None else argv))
     if args.no_color:
         import os
+
         os.environ["NO_COLOR"] = "1"
         os.environ["TERM"] = "dumb"
     setup_logging(args.verbose, log_file=args.log_file)
@@ -711,9 +794,10 @@ def main(argv: list[str] | None = None) -> int:
         raise
     except Exception as e:
         import logging
+
         logging.getLogger("glmbot").exception("command failed: %s", e)
         if args.json:
-            console.print(json.dumps({"ok": False, "error": str(e)[:500]}))
+            _print_json({"ok": False, "error": str(e)[:500]})
         else:
             console.print(f"[red]FAIL failed:[/red] {e}")
         return 1

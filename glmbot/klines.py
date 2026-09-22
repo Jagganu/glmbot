@@ -7,32 +7,37 @@ Behaves like the DataFrame sliver the strategies actually used:
 Plus professional helpers: validation, time-range slicing, CSV export and
 basic statistics for diagnostics and backtest reporting.
 """
+
 from __future__ import annotations
 
 import csv
 from pathlib import Path
-from typing import Dict, List, Optional
 
 
 class Klines:
     __slots__ = ("open_time", "open", "high", "low", "close", "volume", "n")
 
-    def __init__(self, rows: Optional[List[Dict]] = None):
+    def __init__(self, rows: list[dict] | None = None):
         rows = rows or []
-        self.open_time: List[int] = [int(r.get("open_time", i)) for i, r in enumerate(rows)]
-        self.open: List[float] = [float(r.get("open", r.get("close", 0))) for r in rows]
-        self.high: List[float] = [float(r.get("high", r.get("close", 0))) for r in rows]
-        self.low: List[float] = [float(r.get("low", r.get("close", 0))) for r in rows]
-        self.close: List[float] = [float(r.get("close", 0)) for r in rows]
-        self.volume: List[float] = [float(r.get("volume", 0)) for r in rows]
+        self.open_time: list[int] = [int(r.get("open_time", i)) for i, r in enumerate(rows)]
+        self.open: list[float] = [float(r.get("open", r.get("close", 0))) for r in rows]
+        self.high: list[float] = [float(r.get("high", r.get("close", 0))) for r in rows]
+        self.low: list[float] = [float(r.get("low", r.get("close", 0))) for r in rows]
+        self.close: list[float] = [float(r.get("close", 0)) for r in rows]
+        self.volume: list[float] = [float(r.get("volume", 0)) for r in rows]
         self.n = len(rows)
         self._sanitize()
 
     # ---- construction helpers ----
     @classmethod
-    def from_lists(cls, close: List[float], high: Optional[List[float]] = None,
-                   low: Optional[List[float]] = None, volume: Optional[List[float]] = None,
-                   open_: Optional[List[float]] = None) -> "Klines":
+    def from_lists(
+        cls,
+        close: list[float],
+        high: list[float] | None = None,
+        low: list[float] | None = None,
+        volume: list[float] | None = None,
+        open_: list[float] | None = None,
+    ) -> Klines:
         k = cls()
         k.close = [float(c) for c in close]
         n = len(k.close)
@@ -46,7 +51,7 @@ class Klines:
         return k
 
     @classmethod
-    def concat(cls, older: "Klines", newer: "Klines") -> "Klines":
+    def concat(cls, older: Klines, newer: Klines) -> Klines:
         """older rows first, then newer rows."""
         k = cls()
         for f in ("open_time", "open", "high", "low", "close", "volume"):
@@ -54,7 +59,7 @@ class Klines:
         k.n = older.n + newer.n
         return k
 
-    def drop_duplicates_by_time(self) -> "Klines":
+    def drop_duplicates_by_time(self) -> Klines:
         """Deduplicate on open_time, keeping the NEWEST row on conflicts."""
         seen = set()
         out = Klines()
@@ -81,31 +86,34 @@ class Klines:
     def __bool__(self) -> bool:
         return self.n > 0
 
-    def __getitem__(self, i: int) -> Dict:
+    def __getitem__(self, i: int) -> dict:
         return {
             "open_time": self.open_time[i],
-            "open": self.open[i], "high": self.high[i], "low": self.low[i],
-            "close": self.close[i], "volume": self.volume[i],
+            "open": self.open[i],
+            "high": self.high[i],
+            "low": self.low[i],
+            "close": self.close[i],
+            "volume": self.volume[i],
         }
 
-    def rows(self, count: int) -> List[Dict]:
+    def rows(self, count: int) -> list[dict]:
         """Last ``count`` rows as dicts (chronological)."""
         if count <= 0:
             return []
         return [self[i] for i in range(max(0, self.n - count), self.n)]
 
-    def copy(self) -> "Klines":
+    def copy(self) -> Klines:
         k = Klines()
         for f in ("open_time", "open", "high", "low", "close", "volume"):
             setattr(k, f, list(getattr(self, f)))
         k.n = self.n
         return k
 
-    def slice_time(self, start_ms: Optional[int] = None,
-                   end_ms: Optional[int] = None) -> "Klines":
+    def slice_time(self, start_ms: int | None = None, end_ms: int | None = None) -> Klines:
         """Filter rows to [start_ms, end_ms] (inclusive)."""
         idx = [
-            i for i in range(self.n)
+            i
+            for i in range(self.n)
             if (start_ms is None or self.open_time[i] >= start_ms)
             and (end_ms is None or self.open_time[i] <= end_ms)
         ]
@@ -117,12 +125,14 @@ class Klines:
         return k
 
     # ---- diagnostics ----
-    def validate(self) -> List[str]:
+    def validate(self) -> list[str]:
         """Return a list of data-quality issues (empty = clean)."""
-        issues: List[str] = []
+        issues: list[str] = []
         if self.n == 0:
             return ["empty kline series"]
-        lens = {len(getattr(self, f)) for f in ("open_time", "open", "high", "low", "close", "volume")}
+        lens = {
+            len(getattr(self, f)) for f in ("open_time", "open", "high", "low", "close", "volume")
+        }
         if len(lens) != 1:
             issues.append(f"ragged columns: lengths={sorted(lens)}")
         for i in range(self.n):
@@ -143,16 +153,18 @@ class Klines:
             issues.append(f"{dups} duplicate open_time values")
         return issues
 
-    def stats(self) -> Dict[str, float]:
+    def stats(self) -> dict[str, float]:
         if not self.n:
             return {"n": 0}
         first, last = self.close[0], self.close[-1]
         ret = (last / first - 1) * 100 if first else 0.0
         return {
             "n": float(self.n),
-            "first": first, "last": last,
+            "first": first,
+            "last": last,
             "return_pct": ret,
-            "high": max(self.high), "low": min(self.low),
+            "high": max(self.high),
+            "low": min(self.low),
             "volume_total": sum(self.volume),
         }
 
@@ -162,8 +174,16 @@ class Klines:
             w = csv.writer(f)
             w.writerow(["open_time", "open", "high", "low", "close", "volume"])
             for i in range(self.n):
-                w.writerow([self.open_time[i], self.open[i], self.high[i],
-                            self.low[i], self.close[i], self.volume[i]])
+                w.writerow(
+                    [
+                        self.open_time[i],
+                        self.open[i],
+                        self.high[i],
+                        self.low[i],
+                        self.close[i],
+                        self.volume[i],
+                    ]
+                )
         return path
 
     # ---- internals ----

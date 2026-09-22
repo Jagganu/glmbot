@@ -10,26 +10,27 @@ Conventions
 Available: sma, ema, rsi, macd, bollinger, atr, stoch_rsi, vwap,
 supertrend, donchian.
 """
+
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Tuple
+from collections.abc import Sequence
 
 
-def _seq(values: Sequence[float]) -> List[float]:
+def _seq(values: Sequence[float]) -> list[float]:
     try:
         return [float(v) for v in values]
     except (TypeError, ValueError) as e:
         raise ValueError(f"indicator input must be numeric: {e}") from e
 
 
-def _warm(n: int) -> List[None]:
+def _warm(n: int) -> list[None]:
     return [None] * n  # type: ignore[return-value]
 
 
-def sma(values: Sequence[float], period: int) -> List[Optional[float]]:
+def sma(values: Sequence[float], period: int) -> list[float | None]:
     v = _seq(values)
     n = len(v)
-    out: List[Optional[float]] = [None] * n
+    out: list[float | None] = [None] * n
     if period < 1 or n < period:
         return out
     s = sum(v[:period])
@@ -40,10 +41,10 @@ def sma(values: Sequence[float], period: int) -> List[Optional[float]]:
     return out
 
 
-def ema(values: Sequence[float], period: int) -> List[Optional[float]]:
+def ema(values: Sequence[float], period: int) -> list[float | None]:
     v = _seq(values)
     n = len(v)
-    out: List[Optional[float]] = [None] * n
+    out: list[float | None] = [None] * n
     if period < 1 or n < period:
         return out
     alpha = 2.0 / (period + 1)
@@ -56,10 +57,10 @@ def ema(values: Sequence[float], period: int) -> List[Optional[float]]:
     return out
 
 
-def rsi(values: Sequence[float], period: int = 14) -> List[Optional[float]]:
+def rsi(values: Sequence[float], period: int = 14) -> list[float | None]:
     v = _seq(values)
     n = len(v)
-    out: List[Optional[float]] = [None] * n
+    out: list[float | None] = [None] * n
     if period < 1 or n < period + 1:
         return out
     gains = losses = 0.0
@@ -80,20 +81,21 @@ def rsi(values: Sequence[float], period: int = 14) -> List[Optional[float]]:
     return out
 
 
-def macd(values: Sequence[float], fast: int = 12, slow: int = 26, signal: int = 9
-         ) -> Tuple[List[Optional[float]], List[Optional[float]], List[Optional[float]]]:
+def macd(
+    values: Sequence[float], fast: int = 12, slow: int = 26, signal: int = 9
+) -> tuple[list[float | None], list[float | None], list[float | None]]:
     v = _seq(values)
     n = len(v)
     f = ema(v, fast)
     s = ema(v, slow)
-    line: List[Optional[float]] = [None] * n
+    line: list[float | None] = [None] * n
     for i in range(n):
         if f[i] is not None and s[i] is not None:
             line[i] = f[i] - s[i]  # type: ignore[operator]
-    sig: List[Optional[float]] = [None] * n
+    sig: list[float | None] = [None] * n
     first = slow - 1
     if first >= 0 and n - first >= signal and signal > 0:
-        seed_vals = [x for x in line[first:first + signal] if x is not None]
+        seed_vals = [x for x in line[first : first + signal] if x is not None]
         if len(seed_vals) == signal:
             seed = sum(seed_vals) / signal
             sig[first + signal - 1] = seed
@@ -104,43 +106,45 @@ def macd(values: Sequence[float], fast: int = 12, slow: int = 26, signal: int = 
                     continue
                 prev = alpha * line[i] + (1 - alpha) * prev  # type: ignore[operator]
                 sig[i] = prev
-    hist: List[Optional[float]] = [None] * n
+    hist: list[float | None] = [None] * n
     for i in range(n):
         if line[i] is not None and sig[i] is not None:
             hist[i] = line[i] - sig[i]  # type: ignore[operator]
     return line, sig, hist
 
 
-def bollinger(values: Sequence[float], period: int = 20, std_dev: float = 2.0
-              ) -> Tuple[List[Optional[float]], List[Optional[float]], List[Optional[float]]]:
+def bollinger(
+    values: Sequence[float], period: int = 20, std_dev: float = 2.0
+) -> tuple[list[float | None], list[float | None], list[float | None]]:
     v = _seq(values)
     n = len(v)
     mid = sma(v, period)
-    upper: List[Optional[float]] = [None] * n
-    lower: List[Optional[float]] = [None] * n
+    upper: list[float | None] = [None] * n
+    lower: list[float | None] = [None] * n
     if period >= 1 and n >= period:
         for i in range(period - 1, n):
             m = mid[i]
             assert m is not None
-            window = v[i - period + 1:i + 1]
+            window = v[i - period + 1 : i + 1]
             var = sum((x - m) ** 2 for x in window) / period
-            sd = var ** 0.5
+            sd = var**0.5
             upper[i] = m + std_dev * sd
             lower[i] = m - std_dev * sd
     return upper, mid, lower
 
 
-def atr(high: Sequence[float], low: Sequence[float], close: Sequence[float],
-        period: int = 14) -> List[Optional[float]]:
-    h, l, c = _seq(high), _seq(low), _seq(close)
+def atr(
+    high: Sequence[float], low: Sequence[float], close: Sequence[float], period: int = 14
+) -> list[float | None]:
+    h, lo, c = _seq(high), _seq(low), _seq(close)
     n = len(c)
-    out: List[Optional[float]] = [None] * n
-    if period < 1 or n < period + 1 or len(h) != n or len(l) != n:
+    out: list[float | None] = [None] * n
+    if period < 1 or n < period + 1 or len(h) != n or len(lo) != n:
         return out
-    tr = [h[0] - l[0]]
+    tr = [h[0] - lo[0]]
     for i in range(1, n):
-        tr.append(max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1])))
-    prev = sum(tr[1:period + 1]) / period
+        tr.append(max(h[i] - lo[i], abs(h[i] - c[i - 1]), abs(lo[i] - c[i - 1])))
+    prev = sum(tr[1 : period + 1]) / period
     out[period] = prev  # aligned: ATR known from index `period`
     for i in range(period + 1, n):
         prev = (prev * (period - 1) + tr[i]) / period
@@ -148,17 +152,18 @@ def atr(high: Sequence[float], low: Sequence[float], close: Sequence[float],
     return out
 
 
-def stoch_rsi(values: Sequence[float], rsi_period: int = 14,
-              stoch_period: int = 14) -> List[Optional[float]]:
+def stoch_rsi(
+    values: Sequence[float], rsi_period: int = 14, stoch_period: int = 14
+) -> list[float | None]:
     """Stochastic-RSI oscillator in [0, 1] (None during warmup)."""
     v = _seq(values)
     n = len(v)
-    out: List[Optional[float]] = [None] * n
+    out: list[float | None] = [None] * n
     if n < rsi_period + stoch_period:
         return out
     r = rsi(v, rsi_period)
     for i in range(rsi_period + stoch_period - 1, n):
-        window = [x for x in r[i - stoch_period + 1:i + 1] if x is not None]
+        window = [x for x in r[i - stoch_period + 1 : i + 1] if x is not None]
         if len(window) < stoch_period or r[i] is None:
             continue
         lo, hi = min(window), max(window)
@@ -166,15 +171,20 @@ def stoch_rsi(values: Sequence[float], rsi_period: int = 14,
     return out
 
 
-def vwap(high: Sequence[float], low: Sequence[float], close: Sequence[float],
-         volume: Sequence[float], period: int = 20) -> List[Optional[float]]:
+def vwap(
+    high: Sequence[float],
+    low: Sequence[float],
+    close: Sequence[float],
+    volume: Sequence[float],
+    period: int = 20,
+) -> list[float | None]:
     """Rolling VWAP (typical price × volume) over ``period`` bars."""
-    h, l, c, vol = _seq(high), _seq(low), _seq(close), _seq(volume)
+    h, lo, c, vol = _seq(high), _seq(low), _seq(close), _seq(volume)
     n = len(c)
-    out: List[Optional[float]] = [None] * n
+    out: list[float | None] = [None] * n
     if period < 1 or n < period:
         return out
-    tp = [(h[i] + l[i] + c[i]) / 3.0 for i in range(n)]
+    tp = [(h[i] + lo[i] + c[i]) / 3.0 for i in range(n)]
     for i in range(period - 1, n):
         pv = sum(tp[j] * vol[j] for j in range(i - period + 1, i + 1))
         vv = sum(vol[j] for j in range(i - period + 1, i + 1))
@@ -182,32 +192,44 @@ def vwap(high: Sequence[float], low: Sequence[float], close: Sequence[float],
     return out
 
 
-def supertrend(high: Sequence[float], low: Sequence[float], close: Sequence[float],
-               period: int = 10, multiplier: float = 3.0
-               ) -> Tuple[List[Optional[float]], List[Optional[str]]]:
+def supertrend(
+    high: Sequence[float],
+    low: Sequence[float],
+    close: Sequence[float],
+    period: int = 10,
+    multiplier: float = 3.0,
+) -> tuple[list[float | None], list[str | None]]:
     """Supertrend line + direction ('up' | 'down' | None per bar)."""
-    h, l, c = _seq(high), _seq(low), _seq(close)
+    h, lo, c = _seq(high), _seq(low), _seq(close)
     n = len(c)
-    line: List[Optional[float]] = [None] * n
-    direction: List[Optional[str]] = [None] * n
+    line: list[float | None] = [None] * n
+    direction: list[str | None] = [None] * n
     if n < period + 1 or period < 1:
         return line, direction
-    a = atr(h, l, c, period)
+    a = atr(h, lo, c, period)
     prev_upper = prev_lower = None
     prev_close = None
     prev_dir = "down"
     for i in range(n):
         if a[i] is None:
             continue
-        basic_upper = (h[i] + l[i]) / 2 + multiplier * a[i]  # type: ignore[operator]
-        basic_lower = (h[i] + l[i]) / 2 - multiplier * a[i]  # type: ignore[operator]
+        basic_upper = (h[i] + lo[i]) / 2 + multiplier * a[i]  # type: ignore[operator]
+        basic_lower = (h[i] + lo[i]) / 2 - multiplier * a[i]  # type: ignore[operator]
         if prev_upper is None:
             prev_upper, prev_lower, prev_close = basic_upper, basic_lower, c[i]
             direction[i] = prev_dir
             line[i] = basic_upper
             continue
-        upper = basic_upper if (basic_upper < prev_upper or (prev_close is not None and prev_close > prev_upper)) else prev_upper
-        lower = basic_lower if (basic_lower > prev_lower or (prev_close is not None and prev_close < prev_lower)) else prev_lower
+        upper = (
+            basic_upper
+            if (basic_upper < prev_upper or (prev_close is not None and prev_close > prev_upper))
+            else prev_upper
+        )
+        lower = (
+            basic_lower
+            if (basic_lower > prev_lower or (prev_close is not None and prev_close < prev_lower))
+            else prev_lower
+        )
         if c[i] > upper:
             cur = "up"
         elif c[i] < lower:
@@ -220,16 +242,17 @@ def supertrend(high: Sequence[float], low: Sequence[float], close: Sequence[floa
     return line, direction
 
 
-def donchian(high: Sequence[float], low: Sequence[float],
-             period: int = 20) -> Tuple[List[Optional[float]], List[Optional[float]]]:
+def donchian(
+    high: Sequence[float], low: Sequence[float], period: int = 20
+) -> tuple[list[float | None], list[float | None]]:
     """Donchian channel: (upper, lower) = rolling max(high) / min(low)."""
-    h, l = _seq(high), _seq(low)
+    h, lo = _seq(high), _seq(low)
     n = len(h)
-    upper: List[Optional[float]] = [None] * n
-    lower: List[Optional[float]] = [None] * n
+    upper: list[float | None] = [None] * n
+    lower: list[float | None] = [None] * n
     if period < 1 or n < period:
         return upper, lower
     for i in range(period - 1, n):
-        upper[i] = max(h[i - period + 1:i + 1])
-        lower[i] = min(l[i - period + 1:i + 1])
+        upper[i] = max(h[i - period + 1 : i + 1])
+        lower[i] = min(lo[i - period + 1 : i + 1])
     return upper, lower

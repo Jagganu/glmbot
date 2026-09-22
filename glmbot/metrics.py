@@ -3,20 +3,21 @@
 All functions accept plain float lists. Returns 0.0 (never NaN) on
 degenerate input so reports and tables always render.
 """
+
 from __future__ import annotations
 
 import math
-from typing import List, Sequence
+from collections.abc import Sequence
 
 
-def _clean(curve: Sequence[float]) -> List[float]:
+def _clean(curve: Sequence[float]) -> list[float]:
     return [float(x) for x in curve if x is not None and math.isfinite(float(x))]
 
 
-def returns_from_equity(curve: Sequence[float]) -> List[float]:
+def returns_from_equity(curve: Sequence[float]) -> list[float]:
     """Simple per-step returns from an equity curve."""
     c = _clean(curve)
-    out: List[float] = []
+    out: list[float] = []
     for i in range(1, len(c)):
         prev = c[i - 1]
         out.append((c[i] / prev - 1.0) if prev else 0.0)

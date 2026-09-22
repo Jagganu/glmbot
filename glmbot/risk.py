@@ -10,6 +10,7 @@ It never moves down.
 Entry gates (in order): max positions -> daily kill switch -> daily trade
 budget -> per-symbol cooldown.
 """
+
 from __future__ import annotations
 
 import logging
@@ -17,7 +18,6 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Dict, Optional
 
 from .config import RiskCfg
 from .storage import Store
@@ -29,9 +29,9 @@ MIN_NOTIONAL_QUOTE = 10.0  # Binance practical minimum; mirrors position_size fl
 
 @dataclass
 class ExitPlan:
-    action: str          # "exit" | "hold"
+    action: str  # "exit" | "hold"
     reason: str
-    trigger_price: Optional[float] = None
+    trigger_price: float | None = None
 
     @property
     def should_exit(self) -> bool:
@@ -44,14 +44,17 @@ class RiskManager:
     def __init__(self, cfg: RiskCfg, store: Store):
         self.cfg = cfg
         self.store = store
-        self._last_entry_ts: Dict[str, float] = {}
+        self._last_entry_ts: dict[str, float] = {}
 
     # ---------------- entries ----------------
     def can_open(self, symbol: str, mode: str) -> tuple[bool, str]:
         """Return (allowed, human-readable reason). Empty reason when allowed."""
         open_pos = self.store.open_positions(mode)
         if len(open_pos) >= self.cfg.max_open_positions:
-            return False, f"max_open_positions reached ({len(open_pos)}/{self.cfg.max_open_positions})"
+            return (
+                False,
+                f"max_open_positions reached ({len(open_pos)}/{self.cfg.max_open_positions})",
+            )
         if self.tripped_today(mode):
             return False, "daily loss cap tripped - trading halted until tomorrow (UTC)"
         if self.cfg.max_daily_trades > 0:
@@ -69,8 +72,7 @@ class RiskManager:
         try:
             trades = self.store.trades(mode=mode, limit=1000)
             return sum(
-                1 for t in trades
-                if t.get("side") == "BUY" and str(t.get("ts", ""))[:10] == today
+                1 for t in trades if t.get("side") == "BUY" and str(t.get("ts", ""))[:10] == today
             )
         except Exception:
             return 0
@@ -101,12 +103,15 @@ class RiskManager:
             log.warning(
                 "DAILY LOSS CAP HIT: -%.2f%% (cap %.2f%%, baseline %.2f -> now %.2f) "
                 "- halting new entries until tomorrow (UTC)",
-                loss_pct, cap, baseline, current_total,
+                loss_pct,
+                cap,
+                baseline,
+                current_total,
             )
             return True
         return False
 
-    def _day_baseline(self, mode: str) -> Optional[float]:
+    def _day_baseline(self, mode: str) -> float | None:
         """First equity snapshot of the current UTC day, else latest."""
         rows = self.store.equity_history(mode, limit=500)
         if not rows:
@@ -134,7 +139,7 @@ class RiskManager:
             return 0.0
         return round(budget, 2)
 
-    def entry_levels(self, price: float, atr: Optional[float] = None) -> Dict[str, float]:
+    def entry_levels(self, price: float, atr: float | None = None) -> dict[str, float]:
         """Stop-loss / take-profit for a fresh entry.
 
         ATR mode (when enabled *and* a valid ATR is supplied) adapts to
@@ -163,7 +168,7 @@ class RiskManager:
             self._last_entry_ts[symbol] = ts
 
     # ---------------- exits ----------------
-    def check_exit(self, pos: Dict, price: float) -> ExitPlan:
+    def check_exit(self, pos: dict, price: float) -> ExitPlan:
         cfg = self.cfg
         entry = float(pos["entry_price"])
         sl, tp = pos.get("stop_loss"), pos.get("take_profit")
@@ -190,8 +195,7 @@ class RiskManager:
                     self.store.update_trail(pos["id"], high, sl)
                 except Exception as e:
                     log.warning("trail persist failed for %s: %s", pos.get("symbol"), e)
-                log.info("%s trail high=%.6g new SL=%.6g",
-                         pos.get("symbol"), high, sl)
+                log.info("%s trail high=%.6g new SL=%.6g", pos.get("symbol"), high, sl)
             trail_sl = high * (1 - cfg.trailing_stop_pct / 100.0)
             if trail_sl > entry and price <= trail_sl:
                 return ExitPlan(

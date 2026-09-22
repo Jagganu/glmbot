@@ -7,17 +7,19 @@ Production notes
     behind a thread lock (safe for the single-process trader loop).
   - :meth:`Store.backup` produces a consistent snapshot file for ops.
 """
+
 from __future__ import annotations
 
+import contextlib
 import csv
 import shutil
 import sqlite3
 import threading
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
-
+from typing import Any
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -93,7 +95,7 @@ class Store:
         if not self._is_memory and not path.startswith("file:"):
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._mem_conn: Optional[sqlite3.Connection] = None
+        self._mem_conn: sqlite3.Connection | None = None
         if self._is_memory:
             self._mem_conn = sqlite3.connect(":memory:", timeout=30.0, check_same_thread=False)
             self._mem_conn.row_factory = sqlite3.Row
@@ -108,10 +110,8 @@ class Store:
                     yield self._mem_conn
                     self._mem_conn.commit()
                 except Exception:
-                    try:
+                    with contextlib.suppress(Exception):
                         self._mem_conn.rollback()
-                    except Exception:
-                        pass
                     raise
                 return
             c = sqlite3.connect(self.path, timeout=30.0)
@@ -137,15 +137,26 @@ class Store:
                 (key, value),
             )
 
-    def get_meta(self, key: str) -> Optional[str]:
+    def get_meta(self, key: str) -> str | None:
         with self._conn() as c:
             row = c.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
             return row["value"] if row else None
 
     # --------------- trades ---------------
-    def insert_trade(self, t: Dict[str, Any]) -> int:
-        cols = ("ts", "mode", "symbol", "side", "qty", "price", "quote_amt",
-                "fee", "reason", "exchange_order_id", "raw")
+    def insert_trade(self, t: dict[str, Any]) -> int:
+        cols = (
+            "ts",
+            "mode",
+            "symbol",
+            "side",
+            "qty",
+            "price",
+            "quote_amt",
+            "fee",
+            "reason",
+            "exchange_order_id",
+            "raw",
+        )
         vals = [t.get(c) for c in cols]
         with self._conn() as c:
             cur = c.execute(
@@ -154,10 +165,15 @@ class Store:
             )
             return int(cur.lastrowid)
 
-    def trades(self, mode: Optional[str] = None, limit: int = 100,
-               symbol: Optional[str] = None, side: Optional[str] = None) -> List[Dict]:
+    def trades(
+        self,
+        mode: str | None = None,
+        limit: int = 100,
+        symbol: str | None = None,
+        side: str | None = None,
+    ) -> list[dict]:
         q = "SELECT * FROM trades"
-        clauses: List[str] = []
+        clauses: list[str] = []
         args: list = []
         if mode:
             clauses.append("mode=?")
@@ -175,28 +191,49 @@ class Store:
         with self._conn() as c:
             return [dict(r) for r in c.execute(q, args)]
 
-    def export_trades_csv(self, path: str, mode: Optional[str] = None) -> int:
+    def export_trades_csv(self, path: str, mode: str | None = None) -> int:
         rows = self.trades(mode=mode, limit=100_000)
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=[
-                "id", "ts", "mode", "symbol", "side", "qty", "price",
-                "quote_amt", "fee", "reason", "exchange_order_id",
-            ])
+            w = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "id",
+                    "ts",
+                    "mode",
+                    "symbol",
+                    "side",
+                    "qty",
+                    "price",
+                    "quote_amt",
+                    "fee",
+                    "reason",
+                    "exchange_order_id",
+                ],
+            )
             w.writeheader()
             for r in reversed(rows):  # chronological for spreadsheets
                 w.writerow({k: r.get(k) for k in w.fieldnames})
         return len(rows)
 
     # --------------- positions ---------------
-    def open_position(self, p: Dict[str, Any]) -> int:
+    def open_position(self, p: dict[str, Any]) -> int:
         with self._conn() as c:
             cur = c.execute(
                 "INSERT INTO positions(symbol,strategy,opened_ts,entry_price,qty,stop_loss,"
                 "take_profit,trail_high,status,mode) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (p["symbol"], p["strategy"], utcnow(), p["entry_price"], p["qty"],
-                 p.get("stop_loss"), p.get("take_profit"), p.get("entry_price"),
-                 "open", p["mode"]),
+                (
+                    p["symbol"],
+                    p["strategy"],
+                    utcnow(),
+                    p["entry_price"],
+                    p["qty"],
+                    p.get("stop_loss"),
+                    p.get("take_profit"),
+                    p.get("entry_price"),
+                    "open",
+                    p["mode"],
+                ),
             )
             return int(cur.lastrowid)
 
@@ -208,7 +245,7 @@ class Store:
                 (utcnow(), exit_price, pnl_quote, pos_id),
             )
 
-    def get_open_position(self, symbol: str, mode: str) -> Optional[Dict]:
+    def get_open_position(self, symbol: str, mode: str) -> dict | None:
         with self._conn() as c:
             row = c.execute(
                 "SELECT * FROM positions WHERE symbol=? AND mode=? AND status='open'",
@@ -216,7 +253,7 @@ class Store:
             ).fetchone()
             return dict(row) if row else None
 
-    def open_positions(self, mode: str) -> List[Dict]:
+    def open_positions(self, mode: str) -> list[dict]:
         with self._conn() as c:
             return [
                 dict(r)
@@ -225,15 +262,16 @@ class Store:
                 )
             ]
 
-    def update_trail(self, pos_id: int, trail_high: float, stop_loss: Optional[float]) -> None:
+    def update_trail(self, pos_id: int, trail_high: float, stop_loss: float | None) -> None:
         with self._conn() as c:
             c.execute(
                 "UPDATE positions SET trail_high=?, stop_loss=? WHERE id=?",
                 (trail_high, stop_loss, pos_id),
             )
 
-    def closed_positions(self, mode: str, symbol: Optional[str] = None,
-                         limit: int = 10_000) -> List[Dict]:
+    def closed_positions(
+        self, mode: str, symbol: str | None = None, limit: int = 10_000
+    ) -> list[dict]:
         q = "SELECT * FROM positions WHERE mode=? AND status='closed'"
         args: list = [mode]
         if symbol:
@@ -252,7 +290,7 @@ class Store:
                 (utcnow(), mode, cash, pos_value, cash + pos_value),
             )
 
-    def equity_history(self, mode: str, limit: int = 500) -> List[Dict]:
+    def equity_history(self, mode: str, limit: int = 500) -> list[dict]:
         with self._conn() as c:
             rows = c.execute(
                 "SELECT * FROM equity WHERE mode=? ORDER BY id DESC LIMIT ?", (mode, limit)
@@ -267,7 +305,7 @@ class Store:
                 (utcnow(), sig.symbol, sig.strategy, sig.side, sig.price, sig.reason),
             )
 
-    def recent_signals(self, limit: int = 50) -> List[Dict]:
+    def recent_signals(self, limit: int = 50) -> list[dict]:
         with self._conn() as c:
             return [
                 dict(r)
@@ -286,7 +324,7 @@ class Store:
             return float(default)
 
     # --------------- ops ---------------
-    def counts(self) -> Dict[str, int]:
+    def counts(self) -> dict[str, int]:
         with self._conn() as c:
             out = {}
             for tbl in ("trades", "positions", "equity", "signals"):

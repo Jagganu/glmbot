@@ -9,6 +9,7 @@ Features
 Environment
   - ``GLMBOT_LOG_LEVEL`` overrides the default level (DEBUG with -v else INFO).
 """
+
 from __future__ import annotations
 
 import logging
@@ -16,7 +17,6 @@ import logging.handlers
 import os
 import re
 from pathlib import Path
-from typing import Optional
 
 _SECRET_PATTERNS = [
     re.compile(r"(api[_-]?secret\s*[:=]\s*)(['\"]?)([A-Za-z0-9/+_=.-]{8,})\2", re.IGNORECASE),
@@ -46,7 +46,7 @@ def _log_file_path() -> Path:
     return Path("data") / "logs" / "glmbot.log"
 
 
-def setup_logging(verbose: bool = False, log_file: Optional[str] = None) -> logging.Logger:
+def setup_logging(verbose: bool = False, log_file: str | None = None) -> logging.Logger:
     """Configure root + glmbot loggers. Safe to call multiple times."""
     global _CONFIGURED
     level_name = os.environ.get("GLMBOT_LOG_LEVEL", "")
@@ -70,8 +70,11 @@ def setup_logging(verbose: bool = False, log_file: Optional[str] = None) -> logg
 
         console = _get_console()
         handler: logging.Handler = RichHandler(
-            console=console, rich_tracebacks=True, show_path=False,
-            markup=True, log_time_format="[%H:%M:%S]",
+            console=console,
+            rich_tracebacks=True,
+            show_path=False,
+            markup=True,
+            log_time_format="[%H:%M:%S]",
         )
         handler.setFormatter(logging.Formatter("%(message)s", datefmt="%H:%M:%S"))
     except Exception:
