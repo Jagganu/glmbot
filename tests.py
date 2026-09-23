@@ -614,22 +614,22 @@ class TestProtectionClient(unittest.TestCase):
     def test_place_protection_stop_payload(self):
         c = self._client()
         res = c.place_protection_stop("BNBUSDT", "SELL", "0.05", "778.13", "STOP_MARKET")
-        self.assertEqual(res["orderId"], 333)
+        self.assertEqual(res["algoId"], 111)
         method, url, kw = c.s.calls[-1]
         self.assertEqual(method, "POST")
-        self.assertIn("/fapi/v1/order", url)
+        self.assertIn("/fapi/v1/algoOrder", url)
         data = str(kw["data"])
         self.assertIn("type=STOP_MARKET", data)
-        self.assertIn("quantity=0.05", data)
-        self.assertIn("reduceOnly=true", data)
-        self.assertIn("stopPrice=778.13", data)
+        self.assertIn("algoType=CONDITIONAL", data)
+        self.assertIn("triggerPrice=778.13", data)
         self.assertIn("workingType=MARK_PRICE", data)
+        self.assertIn("closePosition=true", data)
         self.assertIn("signature=", data)
 
     def test_place_take_profit_payload(self):
         c = self._client()
         res = c.place_protection_stop("BNBUSDT", "SELL", "0.05", "821.45", "TAKE_PROFIT_MARKET")
-        self.assertEqual(res["orderId"], 444)
+        self.assertEqual(res["algoId"], 222)
 
     def test_cancel_and_open_orders(self):
         c = self._client()
@@ -665,14 +665,14 @@ class _StubFuturesClient:
 
     def place_protection_stop(self, symbol, side, quantity, stop_price, kind):
         self.calls.append(("protect", symbol, side, quantity, stop_price, kind))
-        oid = 333 if kind == "STOP_MARKET" else 444
-        return {"orderId": oid, "status": "NEW"}
+        oid = 111 if kind == "STOP_MARKET" else 222
+        return {"algoId": oid, "status": "NEW"}
 
-    def cancel_order(self, symbol, order_id):
-        self.calls.append(("cancel", symbol, order_id))
-        if order_id == 999:
+    def cancel_algo_order(self, symbol, algo_id):
+        self.calls.append(("cancel", symbol, algo_id))
+        if algo_id == 999:
             raise BinanceError(400, -2011, "Unknown order sent")
-        return {"status": "CANCELED"}
+        return {"code": 200, "msg": "success"}
 
     def futures_position_risk(self, symbol=None):
         return [{"symbol": symbol or "BNBUSDT", "positionAmt": self._amt}]
@@ -685,7 +685,7 @@ class TestFuturesProtectionBroker(unittest.TestCase):
     def test_place_rounds_to_tick(self):
         b = self._broker()
         ids = b.place_protection_orders("BNBUSDT", 0.05, 778.134, 821.459)
-        self.assertEqual(ids, {"stop_order_id": 333, "take_order_id": 444})
+        self.assertEqual(ids, {"stop_order_id": 111, "take_order_id": 222})
         protects = [c for c in b.client.calls if c[0] == "protect"]
         self.assertEqual(protects[0][3], "0.05")  # qty passed through
         self.assertEqual(protects[0][4], "778.13")  # tick-rounded down
