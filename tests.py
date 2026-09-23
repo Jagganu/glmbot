@@ -567,18 +567,22 @@ class _FakeSession:
         return self._record("DELETE", url, **kw)
 
     def _reply(self, method, url, kw):
+        if "openAlgoOrders" in url:
+            return _FakeResp([{"algoId": 111, "symbol": "BNBUSDT"}])
         if "openOrders" in url:
             return _FakeResp([])
         if method == "DELETE":
-            return _FakeResp({"symbol": "BNBUSDT", "orderId": 111, "status": "CANCELED"})
+            return _FakeResp({"code": 200, "msg": "success"})
         data = str(kw.get("data", ""))
-        if "type=STOP_MARKET" in data:
-            oid = 111
-        elif "type=TAKE_PROFIT_MARKET" in data:
-            oid = 222
-        else:
-            oid = 0
-        return _FakeResp({"symbol": "BNBUSDT", "orderId": oid, "status": "NEW"})
+        if "algoOrder" in url:
+            if "type=STOP_MARKET" in data:
+                oid = 111
+            elif "type=TAKE_PROFIT_MARKET" in data:
+                oid = 222
+            else:
+                oid = 0
+            return _FakeResp({"algoId": oid, "status": "NEW"})
+        return _FakeResp({})
 
 
 _FILTER_INFO = {
@@ -606,10 +610,10 @@ class TestProtectionClient(unittest.TestCase):
     def test_place_protection_stop_payload(self):
         c = self._client()
         res = c.place_protection_stop("BNBUSDT", "SELL", "778.13", "STOP_MARKET")
-        self.assertEqual(res["orderId"], 111)
+        self.assertEqual(res["algoId"], 111)
         method, url, kw = c.s.calls[-1]
         self.assertEqual(method, "POST")
-        self.assertIn("/fapi/v1/order", url)
+        self.assertIn("/fapi/v1/algoOrder", url)
         data = str(kw["data"])
         self.assertIn("type=STOP_MARKET", data)
         self.assertIn("stopPrice=778.13", data)
@@ -619,16 +623,17 @@ class TestProtectionClient(unittest.TestCase):
     def test_place_take_profit_payload(self):
         c = self._client()
         res = c.place_protection_stop("BNBUSDT", "SELL", "821.45", "TAKE_PROFIT_MARKET")
-        self.assertEqual(res["orderId"], 222)
+        self.assertEqual(res["algoId"], 222)
 
     def test_cancel_and_open_orders(self):
         c = self._client()
-        res = c.cancel_order("BNBUSDT", 111)
-        self.assertEqual(res["status"], "CANCELED")
+        c.cancel_algo_order("BNBUSDT", 111)  # must not raise
         method, url, kw = c.s.calls[-1]
         self.assertEqual(method, "DELETE")
-        self.assertIn("orderId=111", url)  # signed DELETE carries params in the query
+        self.assertIn("/fapi/v1/algoOrder", url)
+        self.assertIn("algoId=111", url)  # signed DELETE carries params in the query
         self.assertIn("signature=", url)
+        self.assertEqual(c.open_algo_orders("BNBUSDT"), [{"algoId": 111, "symbol": "BNBUSDT"}])
         self.assertEqual(c.open_orders("BNBUSDT"), [])
 
 
@@ -655,13 +660,13 @@ class _StubFuturesClient:
     def place_protection_stop(self, symbol, side, stop_price, kind):
         self.calls.append(("protect", symbol, side, stop_price, kind))
         oid = 111 if kind == "STOP_MARKET" else 222
-        return {"orderId": oid, "status": "NEW"}
+        return {"algoId": oid, "status": "NEW"}
 
-    def cancel_order(self, symbol, order_id):
-        self.calls.append(("cancel", symbol, order_id))
-        if order_id == 999:
+    def cancel_algo_order(self, symbol, algo_id):
+        self.calls.append(("cancel", symbol, algo_id))
+        if algo_id == 999:
             raise BinanceError(400, -2011, "Unknown order sent")
-        return {"status": "CANCELED"}
+        return {"code": 200, "msg": "success"}
 
     def futures_position_risk(self, symbol=None):
         return [{"symbol": symbol or "BNBUSDT", "positionAmt": self._amt}]

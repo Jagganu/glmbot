@@ -193,6 +193,10 @@ class BinanceClient:
             self.price_path = "/fapi/v1/ticker/price"
             self.order_path = "/fapi/v1/order"
             self.open_orders_path = "/fapi/v1/openOrders"
+            # Conditional orders (STOP_MARKET / TAKE_PROFIT_MARKET with
+            # closePosition) live behind the Algo Order API, not /order.
+            self.algo_order_path = "/fapi/v1/algoOrder"
+            self.open_algo_orders_path = "/fapi/v1/openAlgoOrders"
             self.account_path = "/fapi/v2/account"
         else:
             self.base = PUB_TN if self.testnet else PUB
@@ -538,14 +542,15 @@ class BinanceClient:
     def place_protection_stop(
         self, symbol: str, side: str, stop_price: str, kind: str = "STOP_MARKET"
     ) -> dict[str, Any]:
-        """Exchange-native safety net: STOP_MARKET or TAKE_PROFIT_MARKET with
-        closePosition=true (closes the whole one-way position at market when
-        the trigger prints). Caller rounds stop_price to the tick size."""
+        """Exchange-native safety net via the Algo Order API: STOP_MARKET or
+        TAKE_PROFIT_MARKET with closePosition=true (closes the whole one-way
+        position at market when the trigger prints). Returns the algo order
+        payload (id under ``algoId``). Caller rounds stop_price to the tick."""
         self._require_futures("place_protection_stop")
         if kind not in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
             raise ValueError(f"unknown protection kind: {kind!r}")
         return self._spost(
-            self.order_path,
+            self.algo_order_path,
             {
                 "symbol": symbol,
                 "side": side,
@@ -554,6 +559,19 @@ class BinanceClient:
                 "closePosition": "true",
             },
         )
+
+    def cancel_algo_order(self, symbol: str, algo_id: int) -> dict[str, Any]:
+        """Cancel one algo (conditional) order. Returns Binance response."""
+        self._require_futures("cancel_algo_order")
+        res = self._sdelete(self.algo_order_path, {"symbol": symbol, "algoId": algo_id})
+        return res if isinstance(res, dict) else {"status": res}
+
+    def open_algo_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        """All open algo (conditional) orders. Empty list when none."""
+        self._require_futures("open_algo_orders")
+        params = {"symbol": symbol} if symbol else {}
+        res = self._sget(self.open_algo_orders_path, params)
+        return res if isinstance(res, list) else []
 
     def set_leverage(self, symbol: str, leverage: int) -> dict[str, Any]:
         self._require_futures("set_leverage")
