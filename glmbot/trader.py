@@ -355,7 +355,9 @@ class Trader:
             log.error("JOURNAL FAILED after BUY %s fill @ %s: %s", symbol, fill["price"], e)
             self.notifier.error(f"[{mode}] BUY {symbol} filled but JOURNAL FAILED: {e}")
             return False
-        self._arm_exchange_stops(symbol, levels["stop_loss"], levels["take_profit"], pos_id)
+        self._arm_exchange_stops(
+            symbol, fill["qty"], levels["stop_loss"], levels["take_profit"], pos_id
+        )
         self.risk.note_entry(symbol)
         try:
             self.store.insert_trade(
@@ -397,7 +399,12 @@ class Trader:
 
     # ---------------- exchange safety net ----------------
     def _arm_exchange_stops(
-        self, symbol: str, stop_loss: float | None, take_profit: float | None, pos_id: int
+        self,
+        symbol: str,
+        qty: float,
+        stop_loss: float | None,
+        take_profit: float | None,
+        pos_id: int,
     ) -> None:
         """Place exchange-native STOP/TP (live futures only). Non-fatal:
         on failure the position stays protected by bot-side risk only."""
@@ -406,7 +413,9 @@ class Trader:
         if not isinstance(self.broker, FuturesBroker):
             return
         try:
-            ids = self.broker.place_protection_orders(symbol, stop_loss or 0.0, take_profit or 0.0)
+            ids = self.broker.place_protection_orders(
+                symbol, qty, stop_loss or 0.0, take_profit or 0.0
+            )
         except Exception as e:
             log.error("exchange stops FAILED for %s (bot-side only): %s", symbol, e)
             self.notifier.error(f"[{self.cfg.mode}] {symbol} exchange stops FAILED: {e}")
@@ -595,7 +604,11 @@ class Trader:
                     continue
                 log.info("arming exchange stops for restored %s", pos["symbol"])
                 self._arm_exchange_stops(
-                    pos["symbol"], pos.get("stop_loss"), pos.get("take_profit"), pos["id"]
+                    pos["symbol"],
+                    pos["qty"],
+                    pos.get("stop_loss"),
+                    pos.get("take_profit"),
+                    pos["id"],
                 )
 
     def run_forever(self) -> None:

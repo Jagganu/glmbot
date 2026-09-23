@@ -313,9 +313,9 @@ class FuturesBroker(LiveBroker):
 
     # ---------------- exchange-native protection (safety net) ----------------
     def place_protection_orders(
-        self, symbol: str, stop_loss: float, take_profit: float
+        self, symbol: str, qty: float, stop_loss: float, take_profit: float
     ) -> dict[str, int | None]:
-        """Place exchange-side STOP_MARKET + TAKE_PROFIT_MARKET (closePosition).
+        """Place exchange-side STOP_MARKET + TAKE_PROFIT_MARKET (reduceOnly).
 
         These live on Binance and fire even if the bot is down. Bot-side
         risk (trailing, signal exits) still acts first in normal operation.
@@ -323,18 +323,19 @@ class FuturesBroker(LiveBroker):
         """
         self._ensure_setup(symbol)
         f = self._filters(symbol)
+        q = fmt_dec(f.round_qty(Decimal(str(qty))))
         ids: dict[str, int | None] = {"stop_order_id": None, "take_order_id": None}
         if stop_loss and stop_loss > 0:
             sp = fmt_dec(f.round_price(Decimal(str(stop_loss))))
-            res = self.client.place_protection_stop(symbol, "SELL", sp, "STOP_MARKET")
-            ids["stop_order_id"] = res.get("algoId", res.get("orderId"))
-            log.info("%s exchange stop placed @ %s (algo %s)", symbol, sp, ids["stop_order_id"])
+            res = self.client.place_protection_stop(symbol, "SELL", q, sp, "STOP_MARKET")
+            ids["stop_order_id"] = res.get("orderId", res.get("algoId"))
+            log.info("%s exchange stop placed @ %s (id %s)", symbol, sp, ids["stop_order_id"])
         if take_profit and take_profit > 0:
             tp = fmt_dec(f.round_price(Decimal(str(take_profit))))
-            res = self.client.place_protection_stop(symbol, "SELL", tp, "TAKE_PROFIT_MARKET")
-            ids["take_order_id"] = res.get("algoId", res.get("orderId"))
+            res = self.client.place_protection_stop(symbol, "SELL", q, tp, "TAKE_PROFIT_MARKET")
+            ids["take_order_id"] = res.get("orderId", res.get("algoId"))
             log.info(
-                "%s exchange take-profit placed @ %s (algo %s)",
+                "%s exchange take-profit placed @ %s (id %s)",
                 symbol,
                 tp,
                 ids["take_order_id"],
@@ -344,17 +345,17 @@ class FuturesBroker(LiveBroker):
     def cancel_protection_orders(
         self, symbol: str, order_ids: list[int | None] | tuple[int | None, ...]
     ) -> None:
-        """Best-effort cancel of protection algo orders (already-fired is fine)."""
+        """Best-effort cancel of protection orders (already-fired is fine)."""
         from .api import BinanceError
 
         for oid in order_ids:
             if not oid:
                 continue
             try:
-                self.client.cancel_algo_order(symbol, int(oid))
+                self.client.cancel_order(symbol, int(oid))
                 log.debug("%s protection order %s cancelled", symbol, oid)
             except BinanceError as e:
-                # Unknown/filled algo order is expected after a fill.
+                # -2011 unknown order (filled/cancelled already) is expected.
                 log.debug("%s cancel protection %s: %s", symbol, oid, e)
             except Exception as e:
                 log.warning("%s cancel protection %s failed: %s", symbol, oid, e)
