@@ -1,11 +1,12 @@
 """Position sizing, entry gating and exit management.
 
 Order of exit checks (first hit wins):
-  1. hard stop-loss -> 2. take-profit -> 3. trailing stop.
+  0. breakeven lock (once trigger reached, SL ratchets to entry + buffer)
+  1. hard stop-loss -> 2. take-profit -> 3. trailing stop -> 4. time stop.
 
 Trailing stop *ratchets*: as price climbs, ``stop_loss`` is raised to
 ``trail_high * (1 - trailing_pct)`` and persisted via ``Store.update_trail``.
-It never moves down.
+It never moves down. Breakeven is the same ratchet idea, applied once.
 
 Entry gates (in order): max positions -> daily kill switch -> daily trade
 budget -> per-symbol cooldown.
@@ -175,6 +176,22 @@ class RiskManager:
         sl = float(sl) if sl is not None else None
         tp = float(tp) if tp is not None else None
 
+        # 0. breakeven lock: once comfortably in profit, the worst case
+        # becomes entry + buffer (persisted like the trailing ratchet).
+        if cfg.breakeven_trigger_pct > 0 and entry > 0:
+            be_trigger = entry * (1 + cfg.breakeven_trigger_pct / 100.0)
+            if price >= be_trigger:
+                be_sl = entry * (1 + cfg.breakeven_buffer_pct / 100.0)
+                if sl is None or be_sl > sl:
+                    sl = be_sl
+                    try:
+                        self.store.update_trail(
+                            pos["id"], float(pos.get("trail_high") or entry), sl
+                        )
+                    except Exception as e:
+                        log.warning("breakeven persist failed for %s: %s", pos.get("symbol"), e)
+                    log.info("%s breakeven locked SL=%.6g", pos.get("symbol"), sl)
+
         # 1. hard stop-loss
         if sl is not None and price <= sl:
             return ExitPlan("exit", f"stop-loss hit ({price:.6g} <= SL {sl:.6g})", price)
@@ -201,7 +218,29 @@ class RiskManager:
                 return ExitPlan(
                     "exit", f"trailing stop ({price:.6g} <= trail {trail_sl:.6g})", price
                 )
+
+        # 4. time stop: exit dead-money positions based on opened_ts age.
+        if cfg.max_hold_min > 0:
+            age_min = self._position_age_min(pos)
+            if age_min is not None and age_min >= cfg.max_hold_min:
+                return ExitPlan(
+                    "exit",
+                    f"time stop ({age_min:.0f}m held, cap {cfg.max_hold_min}m)",
+                    price,
+                )
         return ExitPlan("hold", "")
+
+    @staticmethod
+    def _position_age_min(pos: dict) -> float | None:
+        """Minutes since opened_ts (UTC '...Z'), or None if unparseable."""
+        opened = pos.get("opened_ts")
+        if not opened:
+            return None
+        try:
+            dt = datetime.strptime(opened, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            return None
+        return (datetime.now(timezone.utc) - dt).total_seconds() / 60.0
 
 
 def round_step(value: Decimal, step: Decimal) -> Decimal:

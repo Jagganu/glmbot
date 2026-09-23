@@ -1,6 +1,20 @@
 # Changelog — glmbot
 # Follows Keep a Changelog (https://keepachangelog.com). Versions are SemVer.
 
+## [1.3.0] — 2026-09-23
+### Added
+- 4 new strategies (10 total): `vwap_trend` (VWAP cross), `stoch_rsi_cross`
+  (momentum ignition), `bollinger_squeeze` (volatility breakout after pinch),
+  `trend_momentum` (EMA-stack regime + RSI 50-cross). Off by default — enabling
+  changes vote math, backtest first.
+- Breakeven stop: once up `breakeven_trigger_pct` (default 2%), SL locks to
+  entry + `breakeven_buffer_pct` (default 0.1%). Persisted like the trailing
+  ratchet; mirrored in the backtester.
+- Time stop: `max_hold_min` (default 0 = off) flat-exits stale positions by
+  `opened_ts` age; mirrored in the backtester via bar timestamps.
+- 10 new tests (56 total): signal ignition per strategy, warmup HOLDs, bad
+  params, breakeven lock/persist/disabled, time-stop trip/disabled.
+
 ## [1.2.0] — 2026-09-23
 ### Added
 - Exchange-native safety net (live futures): every entry attaches

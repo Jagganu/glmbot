@@ -64,6 +64,8 @@ class RiskCfg:
       - ``max_symbol_positions``: reserved for multi-strategy-per-symbol
         portfolios; 1 = current single-position behaviour.
       - ``slippage_bps``: backtest / paper slippage in basis points (0 = none).
+      - ``max_hold_min``: 0 = disabled; else exit a stale position after N minutes.
+    Breakeven is ON by default (2% move locks the stop to entry + 0.1%).
     """
 
     quote_budget: float
@@ -82,6 +84,9 @@ class RiskCfg:
     max_daily_trades: int = 0  # 0 = unlimited
     max_symbol_positions: int = 1
     slippage_bps: float = 0.0
+    breakeven_trigger_pct: float = 2.0  # 0 = disabled; else lock SL at entry+buffer
+    breakeven_buffer_pct: float = 0.1
+    max_hold_min: int = 0  # 0 = disabled; else exit positions older than N minutes
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> RiskCfg:
@@ -103,6 +108,9 @@ class RiskCfg:
                 max_daily_trades=int(d.get("max_daily_trades", 0)),
                 max_symbol_positions=int(d.get("max_symbol_positions", 1)),
                 slippage_bps=float(d.get("slippage_bps", 0.0)),
+                breakeven_trigger_pct=float(d.get("breakeven_trigger_pct", 2.0)),
+                breakeven_buffer_pct=float(d.get("breakeven_buffer_pct", 0.1)),
+                max_hold_min=int(d.get("max_hold_min", 0)),
             )
         except KeyError as e:
             raise ConfigError(f"risk section missing required key: {e}") from e
@@ -135,6 +143,12 @@ class RiskCfg:
             errs.append("risk.max_daily_trades must be >= 0 (0 = unlimited)")
         if self.slippage_bps < 0:
             errs.append("risk.slippage_bps must be >= 0")
+        if self.breakeven_trigger_pct < 0:
+            errs.append("risk.breakeven_trigger_pct must be >= 0 (0 disables)")
+        if self.breakeven_buffer_pct < 0:
+            errs.append("risk.breakeven_buffer_pct must be >= 0")
+        if self.max_hold_min < 0:
+            errs.append("risk.max_hold_min must be >= 0 (0 disables)")
         return errs
 
 
@@ -250,6 +264,9 @@ class BotConfig:
                 "min_votes": self.risk.min_votes,
                 "daily_loss_cap_pct": self.risk.daily_loss_cap_pct,
                 "atr_stops": self.risk.atr_stops,
+                "breakeven_trigger_pct": self.risk.breakeven_trigger_pct,
+                "breakeven_buffer_pct": self.risk.breakeven_buffer_pct,
+                "max_hold_min": self.risk.max_hold_min,
             },
             "config_path": self.config_path,
         }

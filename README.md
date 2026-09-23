@@ -20,12 +20,14 @@ for color.
   (leverage 1–20x, one-way mode, reduceOnly closes). Futures *testnet* has a
   broken price feed, so the bot reads decisions from **real mainnet data**
   while orders execute on testnet (hybrid mode, automatic).
-- **6 strategies, vote consensus** — `ema_cross`, `rsi_reversion`, `macd`,
-  `bollinger`, `supertrend`, `donchian_breakout`. `risk.min_votes: 0` =
+- **10 strategies, vote consensus** — `ema_cross`, `rsi_reversion`, `macd`,
+  `bollinger`, `supertrend`, `donchian_breakout`, `vwap_trend`,
+  `stoch_rsi_cross`, `bollinger_squeeze`, `trend_momentum`. `risk.min_votes: 0` =
   unanimous, `N` = at-least-N-of-M with SELL veto. See `bot.py strategies`.
 - **Risk-first engine** — % budget sizing, max positions, per-symbol cooldown,
-  fixed-% or ATR stops, ratcheting trailing stop, daily-loss kill switch,
-  opt-in daily trade budget. Exits checked *before* entries every cycle.
+  fixed-% or ATR stops, breakeven lock, ratcheting trailing stop, time stop,
+  daily-loss kill switch, opt-in daily trade budget. Exits checked *before*
+  entries every cycle.
 - **Faithful backtester** — same strategy + risk code as live, 1-bar execution
   delay, fees + configurable slippage, ATR/min-votes support, Sharpe/Sortino/
   profit-factor/expectancy/exposure/buy-and-hold metrics, CSV export.
@@ -148,6 +150,9 @@ risk:
   stop_loss_pct: 2.0        # price move (futures: × leverage on margin!)
   take_profit_pct: 4.0
   trailing_stop_pct: 1.5    # 0 = disabled
+  breakeven_trigger_pct: 2.0 # lock SL to entry+buffer once up 2% (0 = off)
+  breakeven_buffer_pct: 0.1
+  max_hold_min: 0          # time-stop: flat-exit stale positions (0 = off)
   cooldown_min: 30
   atr_stops: false          # true = SL/TP from ATR (adapts to volatility)
   atr_sl_mult: 2.0

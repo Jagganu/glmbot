@@ -192,6 +192,60 @@ class TestStrategies(unittest.TestCase):
             build_strategies(["nope"], {})
 
 
+class TestNewStrategies(unittest.TestCase):
+    def _df(self, closes):
+        closes = list(closes)
+        n = len(closes)
+        return Klines.from_lists(
+            close=closes,
+            high=[c * 1.001 for c in closes],
+            low=[c * 0.999 for c in closes],
+            volume=[100.0] * n,
+        )
+
+    def _got_side(self, name, closes, side, params=None):
+        strat = build_strategies([name], {name: params} if params else {})[0]
+        for i in range(10, len(closes) + 1):
+            if strat.evaluate("BTCUSDT", self._df(closes[:i])).side == side:
+                return True
+        return False
+
+    def test_vwap_trend_cross_up(self):
+        closes = [100.0] * 40 + [100 + i * 2.0 for i in range(1, 8)]
+        self.assertTrue(self._got_side("vwap_trend", closes, BUY))
+
+    def test_stoch_rsi_cross_up(self):
+        closes = [100.0] * 30 + [100 - i * 1.0 for i in range(1, 12)]
+        closes += [89 + i * 1.2 for i in range(1, 8)]
+        self.assertTrue(self._got_side("stoch_rsi_cross", closes, BUY))
+
+    def test_bollinger_squeeze_breakout(self):
+        closes = [100.0] * 80 + [106.0]  # flat squeeze, one impulse bar
+        strat = build_strategies(["bollinger_squeeze"], {})[0]
+        self.assertEqual(strat.evaluate("BTCUSDT", self._df(closes)).side, BUY)
+
+    def test_trend_momentum_ignition(self):
+        climb = [100 + i * 0.5 for i in range(60)]
+        dip = [climb[-1] - i * 1.0 for i in range(1, 9)]
+        rec = [dip[-1] + i * 1.0 for i in range(1, 12)]
+        self.assertTrue(self._got_side("trend_momentum", climb + dip + rec, BUY))
+
+    def test_new_strategies_hold_on_short_history(self):
+        for name in ("vwap_trend", "stoch_rsi_cross", "bollinger_squeeze", "trend_momentum"):
+            strat = build_strategies([name], {})[0]
+            self.assertEqual(strat.evaluate("BTCUSDT", self._df([100.0] * 10)).side, "HOLD")
+
+    def test_new_strategies_reject_bad_params(self):
+        for name, bad in (
+            ("vwap_trend", {"period": 1}),
+            ("stoch_rsi_cross", {"oversold": 0.9, "overbought": 0.8}),
+            ("bollinger_squeeze", {"lookback": 1}),
+            ("trend_momentum", {"fast": 50, "slow": 20}),
+        ):
+            with self.assertRaises(ValueError, msg=name):
+                build_strategies([name], {name: bad})
+
+
 class TestRiskManager(unittest.TestCase):
     def _rm(self, tmp):
         cfg = make_cfg()
@@ -276,6 +330,98 @@ class TestRiskManager(unittest.TestCase):
             self.assertEqual(plan.action, "exit")
             # reason can be stop-loss (ratcheted SL) or trailing stop
             self.assertTrue("stop" in plan.reason or "trailing" in plan.reason)
+
+    def test_breakeven_locks_stop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rm, store = self._rm(tmp)  # breakeven trigger 2.0 / buffer 0.1
+            rm.cfg.trailing_stop_pct = 0.0  # isolate breakeven from trailing
+            store.open_position(
+                {
+                    "symbol": "BTCUSDT",
+                    "strategy": "ema_cross",
+                    "entry_price": 100.0,
+                    "qty": 1.0,
+                    "stop_loss": 98.0,
+                    "take_profit": 110.0,
+                    "mode": "paper",
+                }
+            )
+            pos = store.get_open_position("BTCUSDT", "paper")
+            plan = rm.check_exit(pos, 102.5)  # +2.5% hits trigger, below TP
+            self.assertEqual(plan.action, "hold")
+            pos = store.get_open_position("BTCUSDT", "paper")
+            self.assertAlmostEqual(pos["stop_loss"], 100.1)  # locked to entry+buffer
+            # dip below entry now exits on the LOCKED stop (old SL 98 would hold)
+            plan = rm.check_exit(pos, 99.5)
+            self.assertEqual(plan.action, "exit")
+            self.assertIn("stop-loss", plan.reason)
+
+    def test_breakeven_disabled_leaves_stop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rm, store = self._rm(tmp)
+            rm.cfg.breakeven_trigger_pct = 0.0
+            rm.cfg.trailing_stop_pct = 0.0  # isolate: no other ratchet may move SL
+            store.open_position(
+                {
+                    "symbol": "BTCUSDT",
+                    "strategy": "ema_cross",
+                    "entry_price": 100.0,
+                    "qty": 1.0,
+                    "stop_loss": 98.0,
+                    "take_profit": 110.0,
+                    "mode": "paper",
+                }
+            )
+            pos = store.get_open_position("BTCUSDT", "paper")
+            self.assertEqual(rm.check_exit(pos, 103.0).action, "hold")
+            self.assertEqual(store.get_open_position("BTCUSDT", "paper")["stop_loss"], 98.0)
+
+    def test_time_stop_trips_on_stale_position(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rm, store = self._rm(tmp)
+            rm.cfg.max_hold_min = 60
+            pid = store.open_position(
+                {
+                    "symbol": "BTCUSDT",
+                    "strategy": "ema_cross",
+                    "entry_price": 100.0,
+                    "qty": 1.0,
+                    "stop_loss": 98.0,
+                    "take_profit": 110.0,
+                    "mode": "paper",
+                }
+            )
+            with store._conn() as c:
+                c.execute(
+                    "UPDATE positions SET opened_ts=? WHERE id=?",
+                    ("2020-01-01T00:00:00Z", pid),
+                )
+            pos = store.get_open_position("BTCUSDT", "paper")
+            plan = rm.check_exit(pos, 101.0)
+            self.assertEqual(plan.action, "exit")
+            self.assertIn("time stop", plan.reason)
+
+    def test_time_stop_disabled_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rm, store = self._rm(tmp)  # max_hold_min == 0
+            pid = store.open_position(
+                {
+                    "symbol": "BTCUSDT",
+                    "strategy": "ema_cross",
+                    "entry_price": 100.0,
+                    "qty": 1.0,
+                    "stop_loss": 98.0,
+                    "take_profit": 110.0,
+                    "mode": "paper",
+                }
+            )
+            with store._conn() as c:
+                c.execute(
+                    "UPDATE positions SET opened_ts=? WHERE id=?",
+                    ("2020-01-01T00:00:00Z", pid),
+                )
+            pos = store.get_open_position("BTCUSDT", "paper")
+            self.assertEqual(rm.check_exit(pos, 101.0).action, "hold")
 
     def test_max_positions_gate(self):
         with tempfile.TemporaryDirectory() as tmp:

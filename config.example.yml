@@ -1,4 +1,4 @@
-# ================= GLMBOT CONFIG v1.1 =================
+# ================= GLMBOT CONFIG v1.3 =================
 # Copy to config.yml and edit. NEVER commit real keys (config.yml is gitignored).
 #
 # Quick start:
@@ -28,8 +28,10 @@ trading:
   exchange_stops: true
 
 strategies:
-  # Available: ema_cross, rsi_reversion, macd, bollinger, supertrend, donchian_breakout
-  # Run `py bot.py strategies` for signal logic + parameters.
+  # Available: ema_cross, rsi_reversion, macd, bollinger, supertrend,
+  #   donchian_breakout, vwap_trend, stoch_rsi_cross, bollinger_squeeze,
+  #   trend_momentum. Run `py bot.py strategies` for signal logic + parameters.
+  # NOTE: changing `active` changes vote math (risk.min_votes) - backtest first.
   active: ["ema_cross", "rsi_reversion", "macd", "bollinger"]
   ema_cross:
     fast: 9
@@ -50,6 +52,21 @@ strategies:
   #   multiplier: 3.0
   # donchian_breakout:
   #   period: 20
+  # vwap_trend:                # close vs rolling VWAP cross
+  #   period: 20
+  # stoch_rsi_cross:           # momentum ignition (0..1 scale)
+  #   rsi_period: 14
+  #   stoch_period: 14
+  #   oversold: 0.2
+  #   overbought: 0.8
+  # bollinger_squeeze:         # volatility breakout after pinch
+  #   period: 20
+  #   std_dev: 2.0
+  #   lookback: 50
+  # trend_momentum:            # EMA-stack regime + RSI 50-cross
+  #   fast: 20
+  #   slow: 50
+  #   rsi_period: 14
 
 risk:
   quote_budget: 1000.0         # total quote allocated to the bot (sizing anchor)
@@ -59,6 +76,11 @@ risk:
   take_profit_pct: 4.0         # fixed target above entry
   trailing_stop_pct: 1.5       # ratchet distance (0 = disabled)
   cooldown_min: 30             # min minutes between entries per symbol
+  # --- breakeven stop: once up X%, lock SL to entry + buffer (0 = disabled) ---
+  breakeven_trigger_pct: 2.0
+  breakeven_buffer_pct: 0.1
+  # --- time stop: exit stale positions after N minutes (0 = disabled) ---
+  max_hold_min: 0              # e.g. 1440 = flat-exit after 24h without TP
   # --- ATR stops (volatility-adaptive; override fixed % when enabled) ---
   atr_stops: false
   atr_period: 14

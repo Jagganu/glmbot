@@ -157,6 +157,7 @@ class Backtester:
         cash = self.starting
         qty = 0.0
         entry_price = 0.0
+        entry_time: int | None = None  # open_time ms of the fill bar
         margin_locked = 0.0
         stop_loss: float | None = None
         take_profit: float | None = None
@@ -202,6 +203,7 @@ class Backtester:
                             cash -= budget + fee
                             res.total_fees += fee
                             entry_price = fill_price
+                            entry_time = times[i]
                             stop_loss, take_profit = self._levels(fill_price, atr_s[i])
                             trail_high = fill_price
                             res.trades.append(
@@ -221,6 +223,7 @@ class Backtester:
                         cash -= budget
                         res.total_fees += fee
                         entry_price = fill_price
+                        entry_time = times[i]
                         stop_loss, take_profit = self._levels(fill_price, atr_s[i])
                         trail_high = fill_price
                         res.trades.append(
@@ -240,6 +243,12 @@ class Backtester:
             if qty > 0:
                 bars_in_pos += 1
                 exit_reason: str | None = None
+                # 0. breakeven lock (mirrors RiskManager.check_exit)
+                be_trig = self.risk_cfg.breakeven_trigger_pct
+                if be_trig > 0 and entry_price > 0 and close >= entry_price * (1 + be_trig / 100):
+                    be_sl = entry_price * (1 + self.risk_cfg.breakeven_buffer_pct / 100)
+                    if stop_loss is None or be_sl > stop_loss:
+                        stop_loss = be_sl
                 if stop_loss is not None and close <= stop_loss:
                     exit_reason = "stop-loss"
                 elif take_profit is not None and close >= take_profit:
@@ -252,6 +261,13 @@ class Backtester:
                             stop_loss = new_sl
                     if stop_loss is not None and trail_high > entry_price and close <= stop_loss:
                         exit_reason = "trailing-stop"
+                if (
+                    exit_reason is None
+                    and self.risk_cfg.max_hold_min > 0
+                    and entry_time is not None
+                    and (times[i] - entry_time) / 60000 >= self.risk_cfg.max_hold_min
+                ):
+                    exit_reason = "time-stop"
                 if exit_reason is None:
                     # unanimous-SELL strategy exit (matches live trader)
                     votes = self._votes(symbol, window)
@@ -263,6 +279,7 @@ class Backtester:
                     )
                     cash += t.proceeds
                     qty, margin_locked = 0.0, 0.0
+                    entry_time = None
                     stop_loss = take_profit = trail_high = None
                     res.trades.append(t)
 
@@ -315,6 +332,21 @@ class Backtester:
             int(p.get("macd", {}).get("slow", 26)) + int(p.get("macd", {}).get("signal", 9)) + 2,
         )
         need = max(need, int(p.get("bollinger", {}).get("period", 20)) + 2)
+        need = max(need, int(p.get("vwap_trend", {}).get("period", 20)) + 2)
+        need = max(
+            need,
+            int(p.get("stoch_rsi_cross", {}).get("rsi_period", 14))
+            + int(p.get("stoch_rsi_cross", {}).get("stoch_period", 14))
+            + 1,
+        )
+        need = max(
+            need,
+            int(p.get("bollinger_squeeze", {}).get("period", 20))
+            + int(p.get("bollinger_squeeze", {}).get("lookback", 50)),
+        )
+        need = max(need, int(p.get("trend_momentum", {}).get("slow", 50)) + 2)
+        need = max(need, int(p.get("donchian_breakout", {}).get("period", 20)) + 2)
+        need = max(need, int(p.get("supertrend", {}).get("period", 10)) + 3)
         if self.risk_cfg.atr_stops:
             need = max(need, self.risk_cfg.atr_period + 2)
         return need

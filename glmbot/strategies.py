@@ -11,7 +11,8 @@ Conventions
   - Each strategy exposes ``describe()`` metadata for the ``strategies`` CLI.
 
 Built-ins: ema_cross, rsi_reversion, macd, bollinger, supertrend,
-donchian_breakout. Add new ones by subclassing :class:`Strategy` and
+donchian_breakout, vwap_trend, stoch_rsi_cross, bollinger_squeeze,
+trend_momentum. Add new ones by subclassing :class:`Strategy` and
 registering in :data:`REGISTRY`.
 """
 
@@ -21,7 +22,7 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from .indicators import bollinger, donchian, ema, macd, rsi, supertrend
+from .indicators import bollinger, donchian, ema, macd, rsi, stoch_rsi, supertrend, vwap
 from .klines import Klines
 
 log = logging.getLogger("glmbot.strategy")
@@ -304,6 +305,195 @@ class DonchianBreakout(Strategy):
         return Signal(HOLD, "inside channel", symbol, price, self.name)
 
 
+class VWAPTrend(Strategy):
+    """Institutional trend: BUY on close cross above rolling VWAP, SELL below."""
+
+    name = "vwap_trend"
+    meta = StrategyMeta(
+        "vwap_trend",
+        "BUY on close cross above VWAP; SELL on cross below.",
+        {"period": "20 (VWAP lookback)"},
+    )
+
+    def __init__(self, params=None):
+        super().__init__(params)
+        self.period = int(self.params.get("period", 20))
+
+    def validate_params(self) -> None:
+        if int(self.params.get("period", 20)) < 2:
+            raise ValueError("vwap_trend: period must be >= 2")
+
+    def evaluate(self, symbol: str, k: Klines) -> Signal:
+        price = float(k.close[-1]) if k.close else 0.0
+        if len(k) < self.period + 2:
+            return Signal(HOLD, "insufficient history", symbol, price, self.name)
+        v = vwap(k.high, k.low, k.close, k.volume, self.period)
+        if v[-2] is None or v[-1] is None:
+            return Signal(HOLD, "vwap warmup", symbol, price, self.name)
+        prev_above = k.close[-2] > v[-2]
+        curr_above = price > v[-1]
+        if not prev_above and curr_above:
+            return Signal(BUY, "close crossed above VWAP", symbol, price, self.name)
+        if prev_above and not curr_above:
+            return Signal(SELL, "close crossed below VWAP", symbol, price, self.name)
+        state = "above" if curr_above else "below"
+        return Signal(HOLD, f"holding {state} VWAP", symbol, price, self.name)
+
+
+class StochRSICross(Strategy):
+    """Momentum ignition: BUY on StochRSI cross up through oversold,
+    SELL on cross down through overbought."""
+
+    name = "stoch_rsi_cross"
+    meta = StrategyMeta(
+        "stoch_rsi_cross",
+        "BUY on StochRSI cross above oversold; SELL on cross below overbought.",
+        {
+            "rsi_period": "14",
+            "stoch_period": "14",
+            "oversold": "0.2 (0..1)",
+            "overbought": "0.8 (0..1)",
+        },
+    )
+
+    def __init__(self, params=None):
+        super().__init__(params)
+        self.rsi_period = int(self.params.get("rsi_period", 14))
+        self.stoch_period = int(self.params.get("stoch_period", 14))
+        self.os = float(self.params.get("oversold", 0.2))
+        self.ob = float(self.params.get("overbought", 0.8))
+
+    def validate_params(self) -> None:
+        if int(self.params.get("rsi_period", 14)) < 2:
+            raise ValueError("stoch_rsi_cross: rsi_period must be >= 2")
+        if int(self.params.get("stoch_period", 14)) < 2:
+            raise ValueError("stoch_rsi_cross: stoch_period must be >= 2")
+        os_ = float(self.params.get("oversold", 0.2))
+        ob = float(self.params.get("overbought", 0.8))
+        if not 0 <= os_ < ob <= 1:
+            raise ValueError("stoch_rsi_cross: need 0 <= oversold < overbought <= 1")
+
+    def evaluate(self, symbol: str, k: Klines) -> Signal:
+        price = float(k.close[-1]) if k.close else 0.0
+        need = self.rsi_period + self.stoch_period + 1
+        if len(k) < need:
+            return Signal(HOLD, "insufficient history", symbol, price, self.name)
+        s = stoch_rsi(k.close, self.rsi_period, self.stoch_period)
+        prev, cur = s[-2], s[-1]
+        if prev is None or cur is None:
+            return Signal(HOLD, "stoch-rsi warmup", symbol, price, self.name)
+        if prev <= self.os < cur:
+            return Signal(BUY, f"StochRSI crossed above {self.os:g}", symbol, price, self.name)
+        if prev >= self.ob > cur:
+            return Signal(SELL, f"StochRSI crossed below {self.ob:g}", symbol, price, self.name)
+        return Signal(HOLD, f"StochRSI {cur:.2f}", symbol, price, self.name)
+
+
+class BollingerSqueeze(Strategy):
+    """Volatility breakout: bands pinched to a lookback low, then price
+    breaks out - BUY above upper, SELL below lower."""
+
+    name = "bollinger_squeeze"
+    meta = StrategyMeta(
+        "bollinger_squeeze",
+        "BUY on upper-band breakout from squeeze; SELL on lower breakdown.",
+        {
+            "period": "20 (band period)",
+            "std_dev": "2.0 (band width)",
+            "lookback": "50 (squeeze ranking window)",
+        },
+    )
+
+    def __init__(self, params=None):
+        super().__init__(params)
+        self.period = int(self.params.get("period", 20))
+        self.sd = float(self.params.get("std_dev", 2.0))
+        self.lookback = int(self.params.get("lookback", 50))
+
+    def validate_params(self) -> None:
+        if int(self.params.get("period", 20)) < 2:
+            raise ValueError("bollinger_squeeze: period must be >= 2")
+        if int(self.params.get("lookback", 50)) < 2:
+            raise ValueError("bollinger_squeeze: lookback must be >= 2")
+
+    def evaluate(self, symbol: str, k: Klines) -> Signal:
+        closes = k.close
+        price = float(closes[-1]) if closes else 0.0
+        need = self.period + self.lookback
+        if len(closes) < need:
+            return Signal(HOLD, "insufficient history", symbol, price, self.name)
+        upper, mid, lower = bollinger(closes, self.period, self.sd)
+        if upper[-1] is None or mid[-1] is None or lower[-1] is None:
+            return Signal(HOLD, "band warmup", symbol, price, self.name)
+        widths = [
+            (u - lo) / m
+            for u, m, lo in zip(
+                upper[-self.lookback :], mid[-self.lookback :], lower[-self.lookback :], strict=True
+            )
+            if u is not None and m is not None and lo is not None and m != 0
+        ]
+        if len(widths) < self.lookback:
+            return Signal(HOLD, "band warmup", symbol, price, self.name)
+        # Squeeze is judged on the CLOSED prior bar (the breakout bar itself
+        # always expands the band, so it can never be the minimum).
+        was_squeezed = widths[-2] <= min(widths[:-1])
+        u, lo = float(upper[-1]), float(lower[-1])
+        if was_squeezed and price > u:
+            return Signal(BUY, f"squeeze breakout above {u:.6g}", symbol, price, self.name)
+        if was_squeezed and price < lo:
+            return Signal(SELL, f"squeeze breakdown below {lo:.6g}", symbol, price, self.name)
+        state = "squeezed, awaiting break" if was_squeezed else "bands expanded"
+        return Signal(HOLD, state, symbol, price, self.name)
+
+
+class TrendMomentum(Strategy):
+    """Regime + ignition: EMA stack defines trend, RSI 50-cross fires.
+    BUY in uptrend on RSI cross above 50; SELL in downtrend below 50."""
+
+    name = "trend_momentum"
+    meta = StrategyMeta(
+        "trend_momentum",
+        "BUY: uptrend + RSI cross above 50; SELL: downtrend + RSI cross below 50.",
+        {"fast": "20 (trend EMA)", "slow": "50 (regime EMA)", "rsi_period": "14"},
+    )
+
+    def __init__(self, params=None):
+        super().__init__(params)
+        self.fast = int(self.params.get("fast", 20))
+        self.slow = int(self.params.get("slow", 50))
+        self.rsi_period = int(self.params.get("rsi_period", 14))
+
+    def validate_params(self) -> None:
+        fast = int(self.params.get("fast", 20))
+        slow = int(self.params.get("slow", 50))
+        if fast < 2 or slow < 3:
+            raise ValueError("trend_momentum: periods must be >= 2/3")
+        if fast >= slow:
+            raise ValueError("trend_momentum: fast must be < slow")
+        if int(self.params.get("rsi_period", 14)) < 2:
+            raise ValueError("trend_momentum: rsi_period must be >= 2")
+
+    def evaluate(self, symbol: str, k: Klines) -> Signal:
+        closes = k.close
+        price = float(closes[-1]) if closes else 0.0
+        if len(closes) < self.slow + 2:
+            return Signal(HOLD, "insufficient history", symbol, price, self.name)
+        f = ema(closes, self.fast)
+        s = ema(closes, self.slow)
+        r = rsi(closes, self.rsi_period)
+        if f[-1] is None or s[-1] is None or r[-2] is None or r[-1] is None:
+            return Signal(HOLD, "indicator warmup", symbol, price, self.name)
+        uptrend = f[-1] > s[-1]
+        crossed_up = r[-2] <= 50 < r[-1]
+        crossed_down = r[-2] >= 50 > r[-1]
+        if uptrend and crossed_up:
+            return Signal(BUY, "uptrend + RSI ignition above 50", symbol, price, self.name)
+        if not uptrend and crossed_down:
+            return Signal(SELL, "downtrend + RSI breakdown below 50", symbol, price, self.name)
+        regime = "uptrend" if uptrend else "downtrend"
+        return Signal(HOLD, f"{regime}, RSI {r[-1]:.1f}", symbol, price, self.name)
+
+
 REGISTRY: dict[str, type] = {
     EMACross.name: EMACross,
     RSIReversion.name: RSIReversion,
@@ -311,6 +501,10 @@ REGISTRY: dict[str, type] = {
     BollingerStrategy.name: BollingerStrategy,
     SupertrendStrategy.name: SupertrendStrategy,
     DonchianBreakout.name: DonchianBreakout,
+    VWAPTrend.name: VWAPTrend,
+    StochRSICross.name: StochRSICross,
+    BollingerSqueeze.name: BollingerSqueeze,
+    TrendMomentum.name: TrendMomentum,
 }
 
 STRATEGY_CATALOG: list[StrategyMeta] = [cls.meta for cls in REGISTRY.values()]
