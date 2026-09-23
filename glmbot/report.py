@@ -122,7 +122,7 @@ def show_status(cfg, store: Store, client, positions: list[dict]) -> None:
     for r in d["positions"]:
         sl = f"{r['stop_loss']:,.6g}" if r["stop_loss"] else "-"
         if r.get("protected"):
-            sl += " [EX]"
+            sl += " (EX)"
         table.add_row(
             r["symbol"],
             f"{r['qty']:.6f}",
@@ -136,7 +136,7 @@ def show_status(cfg, store: Store, client, positions: list[dict]) -> None:
     _console.print(table)
     if any(r.get("protected") for r in d["positions"]):
         _console.print(
-            "[dim][EX] = exchange-native stop/TP armed (fires even if bot is down)[/dim]"
+            "[dim](EX) = exchange-native stop/TP armed (fires even if bot is down)[/dim]"
         )
 
 
