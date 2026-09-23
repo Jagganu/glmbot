@@ -56,6 +56,7 @@ def status_dict(cfg, store: Store, client, positions: list[dict]) -> dict[str, A
                 "current": cur,
                 "stop_loss": p.get("stop_loss"),
                 "take_profit": p.get("take_profit"),
+                "protected": bool(p.get("stop_order_id") or p.get("take_order_id")),
                 "pnl_quote": round(pnl, 2),
                 "pnl_pct": round((cur / p["entry_price"] - 1) * 100, 2)
                 if p["entry_price"]
@@ -119,17 +120,24 @@ def show_status(cfg, store: Store, client, positions: list[dict]) -> None:
     ):
         table.add_column(col, justify=just)
     for r in d["positions"]:
+        sl = f"{r['stop_loss']:,.6g}" if r["stop_loss"] else "-"
+        if r.get("protected"):
+            sl += " [EX]"
         table.add_row(
             r["symbol"],
             f"{r['qty']:.6f}",
             f"{r['entry']:,.6g}",
             f"{r['current']:,.6g}",
-            f"{r['stop_loss']:,.6g}" if r["stop_loss"] else "-",
+            sl,
             f"{r['take_profit']:,.6g}" if r["take_profit"] else "-",
             colored_pct(r["pnl_pct"]),
             f"{r['pnl_quote']:+.2f}",
         )
     _console.print(table)
+    if any(r.get("protected") for r in d["positions"]):
+        _console.print(
+            "[dim][EX] = exchange-native stop/TP armed (fires even if bot is down)[/dim]"
+        )
 
 
 def show_positions(positions: list[dict]) -> None:

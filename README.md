@@ -158,6 +158,13 @@ risk:
   slippage_bps: 0.0         # backtest slippage (e.g. 5 = 0.05%)
 ```
 
+```yaml
+trading:
+  exchange_stops: true    # live futures: attach STOP_MARKET + TAKE_PROFIT_MARKET
+                          # (closePosition) on every entry - they fire on Binance
+                          # even while the bot is down; bot-side exits act first
+```
+
 **Leverage warning**: at 10x, a 2% adverse move ≈ 20% of margin. Start 1–2x,
 prove the system on paper/testnet, size small live.
 
@@ -237,7 +244,7 @@ optimization for Termux. `data/glm.db` is portable PC ↔ phone.
 
 ```bash
 pip install -r requirements-dev.txt
-python tests.py          # 34 unit tests, no network
+python tests.py          # 46 unit tests, no network
 make lint | make typecheck
 ```
 

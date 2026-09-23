@@ -192,6 +192,7 @@ class BinanceClient:
             self.kline_path = "/fapi/v1/klines"
             self.price_path = "/fapi/v1/ticker/price"
             self.order_path = "/fapi/v1/order"
+            self.open_orders_path = "/fapi/v1/openOrders"
             self.account_path = "/fapi/v2/account"
         else:
             self.base = PUB_TN if self.testnet else PUB
@@ -199,6 +200,7 @@ class BinanceClient:
             self.kline_path = "/api/v3/klines"
             self.price_path = "/api/v3/ticker/price"
             self.order_path = "/api/v3/order"
+            self.open_orders_path = "/api/v3/openOrders"
             self.account_path = "/api/v3/account"
         # --- data source routing ---
         self.data_base = PUB
@@ -270,6 +272,8 @@ class BinanceClient:
                 qs = f"{qs}&signature={sig}"
                 if method == "GET":
                     r = self.s.get(f"{url}?{qs}", timeout=self.timeout)
+                elif method == "DELETE":
+                    r = self.s.delete(f"{url}?{qs}", timeout=self.timeout)
                 else:
                     r = self.s.post(
                         url,
@@ -313,6 +317,9 @@ class BinanceClient:
 
     def _spost(self, path: str, params: dict[str, Any] | None = None) -> Any:
         return self._retry(self._request, self.base, path, params, True, "POST")
+
+    def _sdelete(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        return self._retry(self._request, self.base, path, params, True, "DELETE")
 
     # ---------------- time ----------------
     def ping(self) -> bool:
@@ -512,10 +519,41 @@ class BinanceClient:
                     continue
         return res
 
+    def cancel_order(self, symbol: str, order_id: int) -> dict[str, Any]:
+        """Cancel one open order. Returns Binance response (or raises)."""
+        res = self._sdelete(self.order_path, {"symbol": symbol, "orderId": order_id})
+        return res if isinstance(res, dict) else {"status": res}
+
+    def open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        """All open orders (optionally per symbol). Empty list when none."""
+        params = {"symbol": symbol} if symbol else {}
+        res = self._sget(self.open_orders_path, params)
+        return res if isinstance(res, list) else []
+
     # ---------------- futures-only helpers ----------------
     def _require_futures(self, what: str) -> None:
         if self.market != "futures":
             raise BinanceError(0, 0, f"{what} is futures-only (client market={self.market})")
+
+    def place_protection_stop(
+        self, symbol: str, side: str, stop_price: str, kind: str = "STOP_MARKET"
+    ) -> dict[str, Any]:
+        """Exchange-native safety net: STOP_MARKET or TAKE_PROFIT_MARKET with
+        closePosition=true (closes the whole one-way position at market when
+        the trigger prints). Caller rounds stop_price to the tick size."""
+        self._require_futures("place_protection_stop")
+        if kind not in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+            raise ValueError(f"unknown protection kind: {kind!r}")
+        return self._spost(
+            self.order_path,
+            {
+                "symbol": symbol,
+                "side": side,
+                "type": kind,
+                "stopPrice": stop_price,
+                "closePosition": "true",
+            },
+        )
 
     def set_leverage(self, symbol: str, leverage: int) -> dict[str, Any]:
         self._require_futures("set_leverage")

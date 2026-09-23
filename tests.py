@@ -13,14 +13,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from glmbot.api import BinanceClient, SymbolFilter  # noqa: E402
-from glmbot.broker import FUT_TAKER_FEE, TAKER_FEE, PaperBroker  # noqa: E402
+from glmbot.api import BinanceClient, BinanceError, SymbolFilter  # noqa: E402
+from glmbot.broker import FUT_TAKER_FEE, TAKER_FEE, FuturesBroker, PaperBroker  # noqa: E402
 from glmbot.config import BotConfig, RiskCfg  # noqa: E402
 from glmbot.indicators import bollinger, ema, macd, rsi, sma  # noqa: E402
 from glmbot.klines import Klines  # noqa: E402
+from glmbot.notifier import Notifier  # noqa: E402
 from glmbot.risk import RiskManager  # noqa: E402
 from glmbot.storage import Store, utcnow  # noqa: E402
 from glmbot.strategies import BUY, SELL, build_strategies  # noqa: E402
+from glmbot.trader import Trader  # noqa: E402
 
 
 def make_cfg(mode="paper", strategies=None):
@@ -530,6 +532,241 @@ class TestNoColorCLI(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr.decode("utf-8", "replace")[-500:])
         names = [s["name"] for s in json.loads(p.stdout)]
         self.assertIn("ema_cross", names)
+
+
+class _FakeResp:
+    def __init__(self, payload, status=200):
+        import json as _j
+
+        self._payload = payload
+        self.status_code = status
+        self.text = _j.dumps(payload)
+
+    def json(self):
+        return self._payload
+
+
+class _FakeSession:
+    """Records requests; returns canned Binance payloads (no network)."""
+
+    def __init__(self):
+        self.headers = {}
+        self.calls = []
+
+    def _record(self, method, url, **kw):
+        self.calls.append((method, url, kw))
+        return self._reply(method, url, kw)
+
+    def get(self, url, **kw):
+        return self._record("GET", url, **kw)
+
+    def post(self, url, **kw):
+        return self._record("POST", url, **kw)
+
+    def delete(self, url, **kw):
+        return self._record("DELETE", url, **kw)
+
+    def _reply(self, method, url, kw):
+        if "openOrders" in url:
+            return _FakeResp([])
+        if method == "DELETE":
+            return _FakeResp({"symbol": "BNBUSDT", "orderId": 111, "status": "CANCELED"})
+        data = str(kw.get("data", ""))
+        if "type=STOP_MARKET" in data:
+            oid = 111
+        elif "type=TAKE_PROFIT_MARKET" in data:
+            oid = 222
+        else:
+            oid = 0
+        return _FakeResp({"symbol": "BNBUSDT", "orderId": oid, "status": "NEW"})
+
+
+_FILTER_INFO = {
+    "symbol": "BNBUSDT",
+    "status": "TRADING",
+    "baseAsset": "BNB",
+    "quoteAsset": "USDT",
+    "filters": [
+        {
+            "filterType": "LOT_SIZE",
+            "minQty": "0.001",
+            "maxQty": "100000",
+            "stepSize": "0.001",
+        },
+        {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+        {"filterType": "MIN_NOTIONAL", "notional": "5"},
+    ],
+}
+
+
+class TestProtectionClient(unittest.TestCase):
+    def _client(self):
+        return BinanceClient("k", "s", testnet=True, market="futures", session=_FakeSession())
+
+    def test_place_protection_stop_payload(self):
+        c = self._client()
+        res = c.place_protection_stop("BNBUSDT", "SELL", "778.13", "STOP_MARKET")
+        self.assertEqual(res["orderId"], 111)
+        method, url, kw = c.s.calls[-1]
+        self.assertEqual(method, "POST")
+        self.assertIn("/fapi/v1/order", url)
+        data = str(kw["data"])
+        self.assertIn("type=STOP_MARKET", data)
+        self.assertIn("stopPrice=778.13", data)
+        self.assertIn("closePosition=true", data)
+        self.assertIn("signature=", data)
+
+    def test_place_take_profit_payload(self):
+        c = self._client()
+        res = c.place_protection_stop("BNBUSDT", "SELL", "821.45", "TAKE_PROFIT_MARKET")
+        self.assertEqual(res["orderId"], 222)
+
+    def test_cancel_and_open_orders(self):
+        c = self._client()
+        res = c.cancel_order("BNBUSDT", 111)
+        self.assertEqual(res["status"], "CANCELED")
+        method, url, kw = c.s.calls[-1]
+        self.assertEqual(method, "DELETE")
+        self.assertIn("orderId=111", url)  # signed DELETE carries params in the query
+        self.assertIn("signature=", url)
+        self.assertEqual(c.open_orders("BNBUSDT"), [])
+
+
+class _StubFuturesClient:
+    """Duck-typed futures client: canned filters + scripted protection calls."""
+
+    market = "futures"
+
+    def __init__(self, position_amt="0"):
+        self.calls = []
+        self._amt = position_amt
+
+    def get_filter(self, symbol):
+        return SymbolFilter(dict(_FILTER_INFO, symbol=symbol))
+
+    def change_position_mode(self, hedge=False):
+        self.calls.append(("mode", hedge))
+        return {"msg": "ok"}
+
+    def set_leverage(self, symbol, leverage):
+        self.calls.append(("leverage", symbol, leverage))
+        return {"leverage": leverage}
+
+    def place_protection_stop(self, symbol, side, stop_price, kind):
+        self.calls.append(("protect", symbol, side, stop_price, kind))
+        oid = 111 if kind == "STOP_MARKET" else 222
+        return {"orderId": oid, "status": "NEW"}
+
+    def cancel_order(self, symbol, order_id):
+        self.calls.append(("cancel", symbol, order_id))
+        if order_id == 999:
+            raise BinanceError(400, -2011, "Unknown order sent")
+        return {"status": "CANCELED"}
+
+    def futures_position_risk(self, symbol=None):
+        return [{"symbol": symbol or "BNBUSDT", "positionAmt": self._amt}]
+
+
+class TestFuturesProtectionBroker(unittest.TestCase):
+    def _broker(self, client=None):
+        return FuturesBroker(client or _StubFuturesClient(), leverage=2)
+
+    def test_place_rounds_to_tick(self):
+        b = self._broker()
+        ids = b.place_protection_orders("BNBUSDT", 778.134, 821.459)
+        self.assertEqual(ids, {"stop_order_id": 111, "take_order_id": 222})
+        protects = [c for c in b.client.calls if c[0] == "protect"]
+        self.assertEqual(protects[0][3], "778.13")  # tick-rounded down
+        self.assertEqual(protects[1][3], "821.46")  # tick-rounded half-up
+
+    def test_cancel_best_effort(self):
+        b = self._broker()
+        b.cancel_protection_orders("BNBUSDT", [111, None, 999])  # 999 unknown -> swallowed
+        cancels = [c for c in b.client.calls if c[0] == "cancel"]
+        self.assertEqual([c[1:] for c in cancels], [("BNBUSDT", 111), ("BNBUSDT", 999)])
+
+
+class TestProtectionJournal(unittest.TestCase):
+    def test_ids_persist_and_migrate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "t.db")
+            store = Store(path)
+            pid = store.open_position(
+                {
+                    "symbol": "BNBUSDT",
+                    "strategy": "ema_cross",
+                    "entry_price": 789.86,
+                    "qty": 0.05,
+                    "stop_loss": 778.13,
+                    "take_profit": 821.45,
+                    "mode": "live",
+                }
+            )
+            store.update_protection_orders(pid, 111, 222)
+            pos = store.get_open_position("BNBUSDT", "live")
+            self.assertEqual(pos["stop_order_id"], "111")
+            self.assertEqual(pos["take_order_id"], "222")
+            Store(path)  # reopen: migration must be idempotent
+            self.assertEqual(store.get_open_position("BNBUSDT", "live")["stop_order_id"], "111")
+
+
+class _FailingBroker(FuturesBroker):
+    def sell_market(self, symbol, qty, price_hint, entry_price=None):
+        raise BinanceError(400, -2019, "Margin is insufficient")
+
+
+class TestReconcileFlat(unittest.TestCase):
+    def _trader(self, amt):
+        import shutil
+
+        cfg = make_cfg(mode="live", strategies=["ema_cross"])
+        cfg.market = "futures"
+        cfg.leverage = 2
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        store = Store(os.path.join(tmp, "t.db"))
+        store.open_position(
+            {
+                "symbol": "BNBUSDT",
+                "strategy": "ema_cross",
+                "entry_price": 789.86,
+                "qty": 0.05,
+                "stop_loss": 778.13,
+                "take_profit": 821.45,
+                "mode": "live",
+            }
+        )
+        client = _StubFuturesClient(position_amt=amt)
+        broker = _FailingBroker(client, leverage=2)
+        trader = Trader(cfg, store, client, broker, Notifier({}, {}))
+        return trader, dict(store.get_open_position("BNBUSDT", "live"))
+
+    def test_reconciles_when_exchange_flat(self):
+        trader, pos = self._trader("0")
+        self.assertTrue(trader._reconcile_flat(pos, 775.0))
+        # journal closed with reconcile reason
+        self.assertIsNone(trader.store.get_open_position("BNBUSDT", "live"))
+        trades = trader.store.trades(mode="live")
+        self.assertEqual(trades[0]["reason"][:10], "reconciled")
+
+    def test_keeps_position_when_exchange_open(self):
+        trader, pos = self._trader("0.05")
+        self.assertFalse(trader._reconcile_flat(pos, 775.0))
+        self.assertIsNotNone(trader.store.get_open_position("BNBUSDT", "live"))
+
+    def test_close_position_reconciles_on_sell_failure(self):
+        trader, pos = self._trader("0")
+        self.assertTrue(trader._close_position(pos, 775.0, "stop-loss hit"))
+        self.assertIsNone(trader.store.get_open_position("BNBUSDT", "live"))
+
+    def test_arm_skipped_for_paper(self):
+        cfg = make_cfg(mode="paper", strategies=["ema_cross"])
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(os.path.join(tmp, "t.db"))
+            client = BinanceClient("", "", testnet=True)
+            trader = Trader(cfg, store, client, PaperBroker(client, 1000.0), Notifier({}, {}))
+            trader._arm_exchange_stops("BTCUSDT", 980.0, 1040.0, 1)  # must not raise
+            self.assertEqual(len(store.open_positions("paper")), 0)
 
 
 if __name__ == "__main__":

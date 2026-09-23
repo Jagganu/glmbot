@@ -311,6 +311,51 @@ class FuturesBroker(LiveBroker):
             "margin_freed": 0.0,
         }
 
+    # ---------------- exchange-native protection (safety net) ----------------
+    def place_protection_orders(
+        self, symbol: str, stop_loss: float, take_profit: float
+    ) -> dict[str, int | None]:
+        """Place exchange-side STOP_MARKET + TAKE_PROFIT_MARKET (closePosition).
+
+        These live on Binance and fire even if the bot is down. Bot-side
+        risk (trailing, signal exits) still acts first in normal operation.
+        Raises on transport/auth errors; callers decide fatality.
+        """
+        self._ensure_setup(symbol)
+        f = self._filters(symbol)
+        ids: dict[str, int | None] = {"stop_order_id": None, "take_order_id": None}
+        if stop_loss and stop_loss > 0:
+            sp = fmt_dec(f.round_price(Decimal(str(stop_loss))))
+            res = self.client.place_protection_stop(symbol, "SELL", sp, "STOP_MARKET")
+            ids["stop_order_id"] = res.get("orderId")
+            log.info("%s exchange stop placed @ %s (id %s)", symbol, sp, ids["stop_order_id"])
+        if take_profit and take_profit > 0:
+            tp = fmt_dec(f.round_price(Decimal(str(take_profit))))
+            res = self.client.place_protection_stop(symbol, "SELL", tp, "TAKE_PROFIT_MARKET")
+            ids["take_order_id"] = res.get("orderId")
+            log.info(
+                "%s exchange take-profit placed @ %s (id %s)", symbol, tp, ids["take_order_id"]
+            )
+        return ids
+
+    def cancel_protection_orders(
+        self, symbol: str, order_ids: list[int | None] | tuple[int | None, ...]
+    ) -> None:
+        """Best-effort cancel of protection orders (already-filled is fine)."""
+        from .api import BinanceError
+
+        for oid in order_ids:
+            if not oid:
+                continue
+            try:
+                self.client.cancel_order(symbol, int(oid))
+                log.debug("%s protection order %s cancelled", symbol, oid)
+            except BinanceError as e:
+                # -2011 unknown order (filled/cancelled already) is expected.
+                log.debug("%s cancel protection %s: %s", symbol, oid, e)
+            except Exception as e:
+                log.warning("%s cancel protection %s failed: %s", symbol, oid, e)
+
 
 def fmt_dec(d: Decimal) -> str:
     s = format(d, "f")

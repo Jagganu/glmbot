@@ -164,6 +164,9 @@ class BotConfig:
     telegram: dict[str, Any] = field(default_factory=dict)
     webhook: dict[str, Any] = field(default_factory=dict)
     config_path: str | None = None
+    # Exchange-native STOP_MARKET + TAKE_PROFIT_MARKET on every live futures
+    # entry (safety net that fires even while the bot is down). Default on.
+    exchange_stops: bool = True
 
     @property
     def base_url(self) -> str:
@@ -236,6 +239,7 @@ class BotConfig:
             "update_interval_sec": self.update_interval_sec,
             "base_url": self.base_url,
             "api_key_set": bool(self.api_key and not self.api_key.startswith("YOUR_")),
+            "exchange_stops": self.exchange_stops,
             "risk": {
                 "quote_budget": self.risk.quote_budget,
                 "per_trade_pct": self.risk.per_trade_pct,
@@ -312,6 +316,7 @@ def load_config(path: str | None = None) -> BotConfig:
             telegram=raw.get("notifier", {}).get("telegram", {}) or {},
             webhook=raw.get("notifier", {}).get("webhook", {}) or {},
             config_path=str(p),
+            exchange_stops=bool(trading.get("exchange_stops", True)),
         )
     except (TypeError, ValueError) as e:
         raise ConfigError(f"config has invalid value types: {e}") from e

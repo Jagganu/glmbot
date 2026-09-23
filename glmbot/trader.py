@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .api import BinanceClient
-from .broker import Broker, PaperBroker
+from .broker import Broker, FuturesBroker, PaperBroker
 from .config import BotConfig
 from .indicators import atr as atr_fn
 from .klines import Klines
@@ -338,7 +338,7 @@ class Trader:
             return False
         levels = self.risk.entry_levels(fill["price"], atr_val)
         try:
-            self.store.open_position(
+            pos_id = self.store.open_position(
                 {
                     "symbol": symbol,
                     "strategy": sig.strategy,
@@ -355,6 +355,7 @@ class Trader:
             log.error("JOURNAL FAILED after BUY %s fill @ %s: %s", symbol, fill["price"], e)
             self.notifier.error(f"[{mode}] BUY {symbol} filled but JOURNAL FAILED: {e}")
             return False
+        self._arm_exchange_stops(symbol, levels["stop_loss"], levels["take_profit"], pos_id)
         self.risk.note_entry(symbol)
         try:
             self.store.insert_trade(
@@ -394,6 +395,105 @@ class Trader:
                 self.store.set_paper_state(self.broker.cash)
         return True
 
+    # ---------------- exchange safety net ----------------
+    def _arm_exchange_stops(
+        self, symbol: str, stop_loss: float | None, take_profit: float | None, pos_id: int
+    ) -> None:
+        """Place exchange-native STOP/TP (live futures only). Non-fatal:
+        on failure the position stays protected by bot-side risk only."""
+        if not self.cfg.exchange_stops or self.cfg.mode != "live":
+            return
+        if not isinstance(self.broker, FuturesBroker):
+            return
+        try:
+            ids = self.broker.place_protection_orders(symbol, stop_loss or 0.0, take_profit or 0.0)
+        except Exception as e:
+            log.error("exchange stops FAILED for %s (bot-side only): %s", symbol, e)
+            self.notifier.error(f"[{self.cfg.mode}] {symbol} exchange stops FAILED: {e}")
+            return
+        try:
+            self.store.update_protection_orders(
+                pos_id, ids.get("stop_order_id"), ids.get("take_order_id")
+            )
+        except Exception as e:
+            log.error("protection journal failed for %s: %s", symbol, e)
+
+    def _disarm_exchange_stops(self, pos: dict) -> None:
+        """Best-effort cancel of a position's exchange stops (post-close)."""
+        if not isinstance(self.broker, FuturesBroker):
+            return
+        oids = [pos.get("stop_order_id"), pos.get("take_order_id")]
+        if not any(oids):
+            return
+        try:
+            self.broker.cancel_protection_orders(pos["symbol"], oids)
+        except Exception as e:
+            log.warning("cancel protection failed for %s: %s", pos["symbol"], e)
+
+    def _reconcile_flat(self, pos: dict, price: float) -> bool:
+        """Journal-close when the exchange shows no position.
+
+        Happens when our exchange stop fired while the bot was away (or a
+        manual close): the close order then fails, but economically we are
+        flat. Returns True when reconciled.
+        """
+        if not isinstance(self.broker, FuturesBroker):
+            return False
+        symbol = pos["symbol"]
+        try:
+            risks = self.client.futures_position_risk(symbol=symbol)
+        except Exception as e:
+            log.warning("reconcile query failed for %s: %s", symbol, e)
+            return False
+        amt = 0.0
+        for r in risks or []:
+            try:
+                amt = max(amt, abs(float(r.get("positionAmt", 0) or 0)))
+            except (TypeError, ValueError):
+                continue
+        if amt > 0:
+            return False  # genuinely still open - retry next cycles
+        exit_price = float(price)
+        qty = float(pos["qty"])
+        pnl = (exit_price - float(pos["entry_price"])) * qty  # fee unknown here
+        reason = "reconciled: exchange already flat (stop fired while away), fee excluded"
+        try:
+            self.store.close_position(pos["id"], exit_price, pnl)
+            self.store.insert_trade(
+                {
+                    "ts": utcnow(),
+                    "mode": self.cfg.mode,
+                    "symbol": symbol,
+                    "side": "SELL",
+                    "qty": qty,
+                    "price": exit_price,
+                    "quote_amt": qty * exit_price,
+                    "fee": 0.0,
+                    "reason": reason,
+                    "exchange_order_id": "",
+                    "raw": "",
+                }
+            )
+        except Exception as e:
+            log.error("reconcile journal failed for %s: %s", symbol, e)
+            return False
+        pct = (exit_price / pos["entry_price"] - 1) * 100 if pos["entry_price"] else 0.0
+        msg = format_sell(
+            self.cfg.mode,
+            symbol,
+            qty,
+            exit_price,
+            pnl,
+            self.cfg.quote_asset,
+            pct,
+            reason,
+            self.cfg.leverage,
+            self.cfg.market,
+        )
+        log.info(msg)
+        self.notifier.trade(msg)
+        return True
+
     def _close_position(self, pos: dict, price: float, reason: str) -> bool:
         mode = self.cfg.mode
         symbol = pos["symbol"]
@@ -403,8 +503,12 @@ class Trader:
             )
         except Exception as e:
             log.error("SELL %s failed: %s", symbol, e)
+            if self._reconcile_flat(pos, price):
+                return True
             self.notifier.error(f"[{mode}] SELL {symbol} FAILED: {e}")
             return False
+        # Our fill closed it - withdraw the exchange safety net (best effort).
+        self._disarm_exchange_stops(pos)
         exit_price = float(fill["price"])
         pnl = (
             float(fill["gross"])
@@ -481,6 +585,18 @@ class Trader:
                 pass
         if positions:
             log.info("restored %d open position(s) + cooldowns from journal", len(positions))
+        # Arm exchange stops for restored positions that predate the feature
+        # (or whose placement failed): the journal SL/TP becomes the backstop.
+        if self.cfg.mode == "live" and isinstance(self.broker, FuturesBroker):
+            for pos in positions:
+                if pos.get("stop_order_id") or pos.get("take_order_id"):
+                    continue
+                if not pos.get("stop_loss"):
+                    continue
+                log.info("arming exchange stops for restored %s", pos["symbol"])
+                self._arm_exchange_stops(
+                    pos["symbol"], pos.get("stop_loss"), pos.get("take_profit"), pos["id"]
+                )
 
     def run_forever(self) -> None:
         log.info(

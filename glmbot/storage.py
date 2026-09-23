@@ -52,6 +52,8 @@ CREATE TABLE IF NOT EXISTS positions (
     exit_price REAL,
     pnl_quote REAL,
     mode TEXT NOT NULL DEFAULT 'paper',
+    stop_order_id TEXT,
+    take_order_id TEXT,
     UNIQUE(symbol, mode, status)
 );
 CREATE INDEX IF NOT EXISTS idx_pos_symbol ON positions(symbol, status);
@@ -101,6 +103,16 @@ class Store:
             self._mem_conn.row_factory = sqlite3.Row
         with self._conn() as c:
             c.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Idempotent schema upgrades for pre-existing journals."""
+        for col in ("stop_order_id", "take_order_id"):
+            try:
+                with self._conn() as c:
+                    c.execute(f"ALTER TABLE positions ADD COLUMN {col} TEXT")
+            except sqlite3.DatabaseError:
+                pass  # column already present
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -236,6 +248,20 @@ class Store:
                 ),
             )
             return int(cur.lastrowid)
+
+    def update_protection_orders(
+        self, pos_id: int, stop_order_id: int | None, take_order_id: int | None
+    ) -> None:
+        """Persist exchange-native stop/TP order ids for a position."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE positions SET stop_order_id=?, take_order_id=? WHERE id=?",
+                (
+                    str(stop_order_id) if stop_order_id else None,
+                    str(take_order_id) if take_order_id else None,
+                    pos_id,
+                ),
+            )
 
     def close_position(self, pos_id: int, exit_price: float, pnl_quote: float) -> None:
         with self._conn() as c:

@@ -1,6 +1,20 @@
 # Changelog — glmbot
 # Follows Keep a Changelog (https://keepachangelog.com). Versions are SemVer.
 
+## [1.2.0] — 2026-09-23
+### Added
+- Exchange-native safety net (live futures): every entry attaches
+  `STOP_MARKET` + `TAKE_PROFIT_MARKET` (`closePosition`) orders that fire on
+  Binance even while the bot is down. Toggle via `trading.exchange_stops`
+  (default true). Order ids journaled (auto-migrated `positions` table);
+  cancelled best-effort after our own fill closes the position; pre-feature
+  positions get armed on startup. `status` marks protected stops with `[EX]`.
+- Exchange reconciliation: if a close fails but `positionRisk` shows flat
+  (stop fired while away / manual close), the journal closes with a
+  `reconciled:` trade instead of leaving a ghost position.
+- 10 new offline tests (46 total) covering order payloads, tick rounding,
+  best-effort cancel, journal migration and reconcile paths.
+
 ## [1.1.0] — 2026-09-22
 ### Added
 - Professional CLI: banner, `version`, `doctor`, `validate`, `export-trades`,

@@ -22,6 +22,10 @@ trading:
   trade_type: "spot"           # spot | futures (futures = USD-M, long-only, one-way mode)
   leverage: 1                  # futures only: 1..20. Start at 1-2! (spot must be 1)
   update_interval_sec: 60      # main loop interval, >= 5 (60 = one check per 15m candle slice)
+  # Exchange-native safety net (live futures only): attach STOP_MARKET +
+  # TAKE_PROFIT_MARKET (closePosition) on every entry. They fire on Binance
+  # even while the bot is down. Bot-side trailing/signal exits act first.
+  exchange_stops: true
 
 strategies:
   # Available: ema_cross, rsi_reversion, macd, bollinger, supertrend, donchian_breakout
