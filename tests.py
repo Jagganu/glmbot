@@ -616,6 +616,7 @@ class TestProtectionClient(unittest.TestCase):
         self.assertIn("/fapi/v1/algoOrder", url)
         data = str(kw["data"])
         self.assertIn("type=STOP_MARKET", data)
+        self.assertIn("algoType=CONDITIONAL", data)
         self.assertIn("stopPrice=778.13", data)
         self.assertIn("closePosition=true", data)
         self.assertIn("signature=", data)

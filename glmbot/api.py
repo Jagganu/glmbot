@@ -555,7 +555,9 @@ class BinanceClient:
                 "symbol": symbol,
                 "side": side,
                 "type": kind,
+                "algoType": "CONDITIONAL",
                 "stopPrice": stop_price,
+                "workingType": "MARK_PRICE",
                 "closePosition": "true",
             },
         )
