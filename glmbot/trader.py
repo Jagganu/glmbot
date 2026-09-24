@@ -57,6 +57,7 @@ class Trader:
         self._stop = False
         self._cycles = 0
         self._cycle_ms: list[float] = []
+        self._sync_notified: set[tuple[str, float]] = set()  # (symbol, trigger) alerted
         for sig in (signal.SIGINT, signal.SIGTERM):
             with contextlib.suppress(OSError, ValueError):  # Windows / non-main-thread
                 signal.signal(sig, self._handle_stop)
@@ -481,8 +482,10 @@ class Trader:
         """Push a ratcheted journal SL up to the exchange (live futures only).
 
         Compares the fresh journal SL against the stored armed trigger; on a
-        meaningful raise, places a new STOP then cancels the old (never
-        unprotected). Failures are non-fatal: bot-side SL still enforces.
+        meaningful raise, cancels the old STOP then places the new one (the
+        endpoint rejects overlapping closePosition stops, so place-first is
+        impossible - the window is ~one round trip). Failures are non-fatal:
+        bot-side SL still enforces, and the next cycle retries.
         """
         if not self.cfg.exchange_stops or self.cfg.mode != "live":
             return
@@ -520,6 +523,13 @@ class Trader:
                 journal_sl,
                 e,
             )
+            key = (fresh["symbol"], round(journal_sl, 8))
+            if key not in self._sync_notified:
+                self._sync_notified.add(key)
+                self.notifier.error(
+                    f"[{self.cfg.mode}] {fresh['symbol']} exchange stop sync FAILED "
+                    f"(bot-side SL {journal_sl:.6g} guards, retrying): {e}"
+                )
             return
         try:
             self.store.update_protection_orders(

@@ -1112,10 +1112,11 @@ class TestTrailingSync(unittest.TestCase):
                 c.execute("UPDATE positions SET stop_loss=? WHERE id=?", (101.0, pid))
             snapshot = {"symbol": "BNBUSDT", "stop_loss": 98.0}
             trader._maybe_sync_exchange_stop(snapshot)
-            replaces = [c for c in client.calls if c[0] == "protect"]
-            self.assertEqual(len(replaces), 1)  # new STOP placed...
+            # cancel-first ordering (-4130 forbids overlapping closePosition stops)
+            seq = [c[0] for c in client.calls if c[0] in ("cancel", "protect")]
+            self.assertEqual(seq, ["cancel", "protect"])
             cancels = [c for c in client.calls if c[0] == "cancel"]
-            self.assertEqual(cancels, [("cancel", "BNBUSDT", 100)])  # ...old cancelled
+            self.assertEqual(cancels, [("cancel", "BNBUSDT", 100)])
             pos = store.get_open_position("BNBUSDT", "live")
             self.assertEqual(pos["stop_order_id"], "111")
             self.assertAlmostEqual(pos["exchange_stop_price"], 101.0)
@@ -1143,6 +1144,26 @@ class TestTrailingSync(unittest.TestCase):
             trader._maybe_sync_exchange_stop(snapshot)  # must not raise
             pos = store.get_open_position("BNBUSDT", "live")
             self.assertEqual(pos["stop_order_id"], "100")  # old order kept
+
+    def test_sync_failure_notifies_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trader, store, client = self._trader(tmp)
+            spy = _SpyNotifier()
+            trader.notifier = spy
+            pid = self._open_armed(store)
+            with store._conn() as c:
+                c.execute("UPDATE positions SET stop_loss=? WHERE id=?", (101.0, pid))
+
+            def boom(*a, **k):
+                raise BinanceError(500, -1000, "exchange down")
+
+            client.place_protection_stop = boom
+            snapshot = {"symbol": "BNBUSDT", "stop_loss": 98.0}
+            trader._maybe_sync_exchange_stop(snapshot)
+            trader._maybe_sync_exchange_stop(snapshot)
+            errors = [t for ev, t in spy.sent if ev == "error"]
+            self.assertEqual(len(errors), 1)
+            self.assertIn("BNBUSDT", errors[0])
 
 
 class _CycleClient:

@@ -352,16 +352,21 @@ class FuturesBroker(LiveBroker):
     def replace_protection_stop(
         self, symbol: str, old_algo_id: int | None, stop_price: float
     ) -> dict[str, int | float | None]:
-        """Move the exchange stop to a ratcheted level: place new first (never
-        unprotected), then cancel the old best-effort. Returns new id+trigger.
-        Raises if the new placement fails (old order left untouched)."""
+        """Move the exchange stop to a ratcheted level.
+
+        Cancel-then-place: the endpoint rejects an overlapping closePosition
+        stop (-4130), so place-first is impossible. The unprotected window is
+        ~one round trip; on placement failure the exception propagates (old
+        order already cancelled) and the caller must alert + retry.
+        Returns new id+trigger.
+        """
         self._ensure_setup(symbol)
         f = self._filters(symbol)
         sp = fmt_dec(f.round_price(Decimal(str(stop_price))))
+        self.cancel_protection_orders(symbol, [old_algo_id])
         res = self.client.place_protection_stop(symbol, "SELL", sp, "STOP_MARKET")
         new_id = res.get("algoId", res.get("orderId"))
         log.info("%s exchange stop moved to %s (algo %s)", symbol, sp, new_id)
-        self.cancel_protection_orders(symbol, [old_algo_id])
         return {"algo_id": new_id, "trigger": float(sp)}
 
     def cancel_protection_orders(
