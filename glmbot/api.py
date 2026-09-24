@@ -457,10 +457,15 @@ class BinanceClient:
         return prices[symbol]
 
     def ticker_prices(self, symbols: list[str]) -> dict[str, float]:
-        """Batch price fetch (one HTTP call for N symbols)."""
+        """Batch price fetch (one HTTP call for N symbols).
+
+        NOTE: ``symbols`` must be compact JSON (no spaces) - Binance rejects
+        pretty-printed arrays with -1100 illegal characters.
+        """
         base = self.data_base if self.using_mainnet_data else self.base
         path = self.data_price_path if self.using_mainnet_data else self.price_path
-        j = self._retry(self._request, base, path, {"symbols": json_dumps(symbols)})
+        payload = _json.dumps(list(symbols), separators=(",", ":"))
+        j = self._retry(self._request, base, path, {"symbols": payload})
         out: dict[str, float] = {}
         if isinstance(j, dict):  # single-symbol response shape
             j = [j]

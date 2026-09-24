@@ -717,6 +717,14 @@ class _FakeSession:
             return _FakeResp([{"algoId": 111, "symbol": "BNBUSDT"}])
         if "openOrders" in url:
             return _FakeResp([])
+        if "ticker/price" in url:
+            import json as _jj
+
+            params = kw.get("params", {}) or {}
+            syms = _jj.loads(params.get("symbols", "[]"))
+            return _FakeResp([{"symbol": s, "price": "100.0"} for s in syms])
+        if method == "DELETE":
+            return _FakeResp({"code": 200, "msg": "success"})
         if method == "DELETE":
             return _FakeResp({"code": 200, "msg": "success"})
         data = str(kw.get("data", ""))
@@ -787,6 +795,21 @@ class TestProtectionClient(unittest.TestCase):
         self.assertIn("signature=", url)
         self.assertEqual(c.open_algo_orders("BNBUSDT"), [{"algoId": 111, "symbol": "BNBUSDT"}])
         self.assertEqual(c.open_orders("BNBUSDT"), [])
+
+    def test_batch_symbols_compact_json(self):
+        # Regression: pretty JSON (spaces) makes Binance reject the batch
+        # endpoint with -1100, silently disabling one-call price fetches.
+        import json as _jj
+
+        c = self._client()
+        self.assertEqual(
+            c.ticker_prices(["BTCUSDT", "ETHUSDT"]), {"BTCUSDT": 100.0, "ETHUSDT": 100.0}
+        )
+        method, _url, kw = c.s.calls[-1]
+        self.assertEqual(method, "GET")
+        raw = kw["params"]["symbols"]
+        self.assertNotIn(" ", raw)
+        self.assertEqual(_jj.loads(raw), ["BTCUSDT", "ETHUSDT"])
 
 
 class _StubFuturesClient:
