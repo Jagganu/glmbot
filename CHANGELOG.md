@@ -1,6 +1,21 @@
 # Changelog — glmbot
 # Follows Keep a Changelog (https://keepachangelog.com). Versions are SemVer.
 
+## [1.4.0] — 2026-09-24
+### Added (Tier 1: survival, honest testing, risk control)
+- Trailing-sync: ratcheted journal SL is pushed to the exchange stop
+  (place-new-then-cancel, never unprotected); armed trigger journaled.
+- Closed-candle signals: live strategy input drops the forming bar, so live
+  matches the backtest (loader drops it too).
+- Per-cycle reconciliation: journal-open/exchange-flat ghosts auto-close
+  (10 min grace); unknown manual positions alert once/day, never auto-traded.
+- Kill-switch trio: consecutive-loss halt (default 3) + peak-drawdown halt
+  (default 10%), UTC-day latched, reason shown in `status`.
+- Constant-risk sizing: `risk_per_trade_pct` (default 1%) sizes by SL
+  distance, capped by the per-trade budget; mirrored in the backtester.
+- 18 new tests (74 total) covering sync, reconcile cycle, kill switches,
+  risk sizing, closed candles.
+
 ## [1.3.0] — 2026-09-23
 ### Added
 - 4 new strategies (10 total): `vwap_trend` (VWAP cross), `stoch_rsi_cross`

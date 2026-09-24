@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS positions (
     mode TEXT NOT NULL DEFAULT 'paper',
     stop_order_id TEXT,
     take_order_id TEXT,
+    exchange_stop_price REAL,
     UNIQUE(symbol, mode, status)
 );
 CREATE INDEX IF NOT EXISTS idx_pos_symbol ON positions(symbol, status);
@@ -107,10 +108,11 @@ class Store:
 
     def _migrate(self) -> None:
         """Idempotent schema upgrades for pre-existing journals."""
-        for col in ("stop_order_id", "take_order_id"):
+        for col in ("stop_order_id", "take_order_id", "exchange_stop_price"):
+            coldef = f"{col} TEXT" if col != "exchange_stop_price" else f"{col} REAL"
             try:
                 with self._conn() as c:
-                    c.execute(f"ALTER TABLE positions ADD COLUMN {col} TEXT")
+                    c.execute(f"ALTER TABLE positions ADD COLUMN {coldef}")
             except sqlite3.DatabaseError:
                 pass  # column already present
 
@@ -250,18 +252,34 @@ class Store:
             return int(cur.lastrowid)
 
     def update_protection_orders(
-        self, pos_id: int, stop_order_id: int | None, take_order_id: int | None
+        self,
+        pos_id: int,
+        stop_order_id: int | None,
+        take_order_id: int | None,
+        stop_trigger: float | None = None,
     ) -> None:
-        """Persist exchange-native stop/TP order ids for a position."""
+        """Persist exchange-native stop/TP order ids (+ the armed trigger price)."""
         with self._conn() as c:
-            c.execute(
-                "UPDATE positions SET stop_order_id=?, take_order_id=? WHERE id=?",
-                (
-                    str(stop_order_id) if stop_order_id else None,
-                    str(take_order_id) if take_order_id else None,
-                    pos_id,
-                ),
-            )
+            if stop_trigger is not None:
+                c.execute(
+                    "UPDATE positions SET stop_order_id=?, take_order_id=?, "
+                    "exchange_stop_price=? WHERE id=?",
+                    (
+                        str(stop_order_id) if stop_order_id else None,
+                        str(take_order_id) if take_order_id else None,
+                        float(stop_trigger),
+                        pos_id,
+                    ),
+                )
+            else:
+                c.execute(
+                    "UPDATE positions SET stop_order_id=?, take_order_id=? WHERE id=?",
+                    (
+                        str(stop_order_id) if stop_order_id else None,
+                        str(take_order_id) if take_order_id else None,
+                        pos_id,
+                    ),
+                )
 
     def close_position(self, pos_id: int, exit_price: float, pnl_quote: float) -> None:
         with self._conn() as c:

@@ -33,6 +33,7 @@ from .indicators import atr as atr_fn
 from .klines import Klines
 from .metrics import max_drawdown as md_fn
 from .metrics import profit_factor, sharpe_ratio, sortino_ratio
+from .risk import RiskManager
 from .strategies import BUY, SELL, Signal, build_strategies
 
 log = logging.getLogger("glmbot.backtest")
@@ -193,6 +194,23 @@ class Backtester:
             if pending_entry is not None and qty == 0:
                 fill_price = close * (1 + self.slip)
                 budget = min(self.starting * self.risk_cfg.per_trade_pct / 100.0, cash)
+                if self.risk_cfg.risk_per_trade_pct > 0:
+                    # Constant-risk sizing (mirrors Trader._open_position):
+                    # preview levels, size by SL distance, cap by budget.
+                    preview_sl, _ = self._levels(fill_price, atr_s[i])
+                    equity = cash + (margin_locked if self.is_futures else 0.0)
+                    sized = RiskManager.risk_size(
+                        self.risk_cfg,
+                        fill_price,
+                        preview_sl,
+                        equity,
+                        leverage=self.leverage,
+                        max_margin=budget,
+                    )
+                    if sized is not None:
+                        budget = sized["margin"] if self.is_futures else sized["notional"]
+                    else:
+                        budget = 0.0
                 if budget >= 10:
                     if self.is_futures:
                         notional = budget * self.leverage

@@ -1,4 +1,4 @@
-# ================= GLMBOT CONFIG v1.3 =================
+# ================= GLMBOT CONFIG v1.4 =================
 # Copy to config.yml and edit. NEVER commit real keys (config.yml is gitignored).
 #
 # Quick start:
@@ -81,6 +81,12 @@ risk:
   breakeven_buffer_pct: 0.1
   # --- time stop: exit stale positions after N minutes (0 = disabled) ---
   max_hold_min: 0              # e.g. 1440 = flat-exit after 24h without TP
+  # --- kill-switch trio: daily cap + consecutive losses + peak drawdown ---
+  consecutive_loss_halt: 3     # halt day after N straight losing closes (0 = off)
+  max_drawdown_halt_pct: 10.0  # halt day after N% drawdown vs peak equity (0 = off)
+  # --- constant-risk sizing: risk N% of equity per trade (SL-distance based),
+  #     capped by per_trade_pct budget (0 = legacy budget sizing) ---
+  risk_per_trade_pct: 1.0
   # --- ATR stops (volatility-adaptive; override fixed % when enabled) ---
   atr_stops: false
   atr_period: 14

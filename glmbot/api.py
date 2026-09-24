@@ -545,12 +545,13 @@ class BinanceClient:
             raise BinanceError(0, 0, f"{what} is futures-only (client market={self.market})")
 
     def place_protection_stop(
-        self, symbol: str, side: str, quantity: str, stop_price: str, kind: str = "STOP_MARKET"
+        self, symbol: str, side: str, stop_price: str, kind: str = "STOP_MARKET"
     ) -> dict[str, Any]:
         """Exchange-native safety net on the Algo Order endpoint: STOP_MARKET
         or TAKE_PROFIT_MARKET with closePosition (whole-position close),
         triggered on MARK_PRICE. Fires on Binance even while the bot is down.
-        Caller rounds stop_price to tickSize (quantity kept for reference)."""
+        Caller rounds stop_price to tickSize. Quantity is intentionally NOT
+        sent: closePosition orders reject it."""
         self._require_futures("place_protection_stop")
         if kind not in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
             raise ValueError(f"unknown protection kind: {kind!r}")

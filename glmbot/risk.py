@@ -48,6 +48,31 @@ class RiskManager:
         self._last_entry_ts: dict[str, float] = {}
 
     # ---------------- entries ----------------
+    def halted(self, mode: str) -> tuple[bool, str]:
+        """Any latched halt for today: daily cap, consecutive losses, drawdown."""
+        if self.tripped_today(mode):
+            return True, "daily loss cap tripped - trading halted until tomorrow (UTC)"
+        if self._latched(f"consloss:{mode}"):
+            return True, (
+                f"{self.cfg.consecutive_loss_halt} consecutive losses - "
+                "trading halted until tomorrow (UTC)"
+            )
+        if self._latched(f"drawdown:{mode}"):
+            return True, (
+                f"peak drawdown {self.cfg.max_drawdown_halt_pct:g}% hit - "
+                "trading halted until tomorrow (UTC)"
+            )
+        return False, ""
+
+    def _latch_key(self, stem: str) -> str:
+        return f"{stem}:{self._today_key()}"
+
+    def _latched(self, stem: str) -> bool:
+        return self.store.get_meta(self._latch_key(stem)) == "1"
+
+    def _latch(self, stem: str) -> None:
+        self.store.set_meta(self._latch_key(stem), "1")
+
     def can_open(self, symbol: str, mode: str) -> tuple[bool, str]:
         """Return (allowed, human-readable reason). Empty reason when allowed."""
         open_pos = self.store.open_positions(mode)
@@ -56,8 +81,9 @@ class RiskManager:
                 False,
                 f"max_open_positions reached ({len(open_pos)}/{self.cfg.max_open_positions})",
             )
-        if self.tripped_today(mode):
-            return False, "daily loss cap tripped - trading halted until tomorrow (UTC)"
+        halted, why = self.halted(mode)
+        if halted:
+            return False, why
         if self.cfg.max_daily_trades > 0:
             today = self._today_key()
             n_today = self._count_entries_today(mode, today)
@@ -123,6 +149,60 @@ class RiskManager:
             return float(todays[0]["total"])
         return float(rows[-1]["total"])
 
+    # ---------------- stronger kill switches ----------------
+    def consecutive_losses(self, mode: str) -> int:
+        """Straight losing closes, most-recent first (unknown PnL breaks streak)."""
+        streak = 0
+        for pos in self.store.closed_positions(mode):
+            pnl = pos.get("pnl_quote")
+            if pnl is None:
+                break
+            try:
+                if float(pnl) < 0:
+                    streak += 1
+                    continue
+            except (TypeError, ValueError):
+                pass
+            break
+        return streak
+
+    def check_consecutive_losses(self, mode: str) -> bool:
+        """Latch a day-halt after N straight losing closes. True when tripped now."""
+        need = self.cfg.consecutive_loss_halt
+        if need <= 0 or self._latched(f"consloss:{mode}"):
+            return False
+        if self.consecutive_losses(mode) >= need:
+            self._latch(f"consloss:{mode}")
+            log.warning(
+                "CONSECUTIVE LOSS HALT: %d straight losses - halting new entries until tomorrow",
+                need,
+            )
+            return True
+        return False
+
+    def check_drawdown_halt(self, mode: str, current_total: float) -> bool:
+        """Latch a day-halt after peak-equity drawdown reaches the cap."""
+        cap = self.cfg.max_drawdown_halt_pct
+        if cap <= 0 or self._latched(f"drawdown:{mode}"):
+            return False
+        rows = self.store.equity_history(mode, limit=1000)
+        if not rows:
+            return False
+        peak = max(float(r["total"]) for r in rows)
+        if peak <= 0:
+            return False
+        dd = (1 - current_total / peak) * 100
+        if dd >= cap:
+            self._latch(f"drawdown:{mode}")
+            log.warning(
+                "DRAWDOWN HALT: -%.2f%% vs peak %.2f (cap %.2f%%) - halting until tomorrow",
+                dd,
+                peak,
+                cap,
+            )
+            return True
+        return False
+
     # ---------------- sizing ----------------
     def position_size(self, price: float, cash_available: float) -> float:
         """Quote-currency amount to risk on the next entry (0 = skip).
@@ -139,6 +219,42 @@ class RiskManager:
         if budget < MIN_NOTIONAL_QUOTE:
             return 0.0
         return round(budget, 2)
+
+    @staticmethod
+    def risk_size(
+        cfg: RiskCfg,
+        entry: float,
+        stop: float,
+        equity: float,
+        leverage: int = 1,
+        max_margin: float | None = None,
+    ) -> dict[str, float] | None:
+        """Constant-risk sizing: risk ``risk_per_trade_pct`` of equity.
+
+        ``qty = risk_amount / SL_distance``; margin capped by ``max_margin``
+        (the per-trade budget) so wide-stop configs can't explode notional.
+        Returns ``{qty, margin, notional}`` or None when disabled/degenerate
+        (zero distance, unaffordable minimum). Callers pass ``margin`` to
+        futures brokers and ``notional`` to spot brokers.
+        """
+        risk_pct = cfg.risk_per_trade_pct
+        if risk_pct <= 0 or equity <= 0 or entry <= 0:
+            return None
+        dist = entry - stop
+        if dist <= 0:
+            return None
+        qty = equity * risk_pct / 100.0 / dist
+        lev = max(1, leverage)
+        notional = qty * entry
+        margin = notional / lev
+        if max_margin is not None and margin > max_margin > 0:
+            scale = max_margin / margin
+            qty *= scale
+            notional *= scale
+            margin = max_margin
+        if margin < MIN_NOTIONAL_QUOTE:
+            return None
+        return {"qty": qty, "margin": round(margin, 2), "notional": round(notional, 2)}
 
     def entry_levels(self, price: float, atr: float | None = None) -> dict[str, float]:
         """Stop-loss / take-profit for a fresh entry.

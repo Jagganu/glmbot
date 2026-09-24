@@ -313,34 +313,56 @@ class FuturesBroker(LiveBroker):
 
     # ---------------- exchange-native protection (safety net) ----------------
     def place_protection_orders(
-        self, symbol: str, qty: float, stop_loss: float, take_profit: float
-    ) -> dict[str, int | None]:
-        """Place exchange-side STOP_MARKET + TAKE_PROFIT_MARKET (reduceOnly).
+        self, symbol: str, stop_loss: float, take_profit: float
+    ) -> dict[str, int | float | None]:
+        """Place exchange-side STOP_MARKET + TAKE_PROFIT_MARKET (closePosition).
 
         These live on Binance and fire even if the bot is down. Bot-side
         risk (trailing, signal exits) still acts first in normal operation.
-        Raises on transport/auth errors; callers decide fatality.
+        Returns ids + tick-rounded triggers for journaling. Raises on
+        transport/auth errors; callers decide fatality.
         """
         self._ensure_setup(symbol)
         f = self._filters(symbol)
-        q = fmt_dec(f.round_qty(Decimal(str(qty))))
-        ids: dict[str, int | None] = {"stop_order_id": None, "take_order_id": None}
+        out: dict[str, int | float | None] = {
+            "stop_order_id": None,
+            "take_order_id": None,
+            "stop_trigger": None,
+            "take_trigger": None,
+        }
         if stop_loss and stop_loss > 0:
             sp = fmt_dec(f.round_price(Decimal(str(stop_loss))))
-            res = self.client.place_protection_stop(symbol, "SELL", q, sp, "STOP_MARKET")
-            ids["stop_order_id"] = res.get("algoId", res.get("orderId"))
-            log.info("%s exchange stop placed @ %s (algo %s)", symbol, sp, ids["stop_order_id"])
+            res = self.client.place_protection_stop(symbol, "SELL", sp, "STOP_MARKET")
+            out["stop_order_id"] = res.get("algoId", res.get("orderId"))
+            out["stop_trigger"] = float(sp)
+            log.info("%s exchange stop placed @ %s (algo %s)", symbol, sp, out["stop_order_id"])
         if take_profit and take_profit > 0:
             tp = fmt_dec(f.round_price(Decimal(str(take_profit))))
-            res = self.client.place_protection_stop(symbol, "SELL", q, tp, "TAKE_PROFIT_MARKET")
-            ids["take_order_id"] = res.get("algoId", res.get("orderId"))
+            res = self.client.place_protection_stop(symbol, "SELL", tp, "TAKE_PROFIT_MARKET")
+            out["take_order_id"] = res.get("algoId", res.get("orderId"))
+            out["take_trigger"] = float(tp)
             log.info(
                 "%s exchange take-profit placed @ %s (algo %s)",
                 symbol,
                 tp,
-                ids["take_order_id"],
+                out["take_order_id"],
             )
-        return ids
+        return out
+
+    def replace_protection_stop(
+        self, symbol: str, old_algo_id: int | None, stop_price: float
+    ) -> dict[str, int | float | None]:
+        """Move the exchange stop to a ratcheted level: place new first (never
+        unprotected), then cancel the old best-effort. Returns new id+trigger.
+        Raises if the new placement fails (old order left untouched)."""
+        self._ensure_setup(symbol)
+        f = self._filters(symbol)
+        sp = fmt_dec(f.round_price(Decimal(str(stop_price))))
+        res = self.client.place_protection_stop(symbol, "SELL", sp, "STOP_MARKET")
+        new_id = res.get("algoId", res.get("orderId"))
+        log.info("%s exchange stop moved to %s (algo %s)", symbol, sp, new_id)
+        self.cancel_protection_orders(symbol, [old_algo_id])
+        return {"algo_id": new_id, "trigger": float(sp)}
 
     def cancel_protection_orders(
         self, symbol: str, order_ids: list[int | None] | tuple[int | None, ...]

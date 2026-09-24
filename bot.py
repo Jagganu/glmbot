@@ -463,14 +463,23 @@ def cmd_backtest(args) -> int:
     for sym in cfg.symbols:
         all_rows: list = []
         end_time = None
+        first_page = True
         while len(all_rows) < target:
             kl = client.klines(
                 sym, "15m", limit=min(1000, target - len(all_rows)), end_time=end_time
             )
             if not kl:
                 break
-            all_rows = kl + all_rows
             end_time = kl[0]["open_time"] - 1
+            if first_page:
+                # Newest page ends at the still-forming candle - drop it so the
+                # backtest runs on closed bars only (#11: no look-ahead).
+                kl = kl[:-1]
+                first_page = False
+            before = len(all_rows)
+            all_rows = kl + all_rows
+            if len(all_rows) == before:
+                break  # no progress (degenerate page) - avoid infinite loop
             if not args.json:
                 console.print(f"  {sym}: {len(all_rows)}/{target} candles", end="\r")
             if len(kl) < min(1000, target):

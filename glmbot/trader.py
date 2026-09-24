@@ -124,10 +124,15 @@ class Trader:
 
     # ---------------- data ----------------
     def _df(self, symbol: str) -> Klines:
+        """Closed candles only (#11): the live feed's last bar is still
+        forming - strategies evaluating it would repaint and diverge from
+        the backtest. Quotes/exits intentionally keep using latest prices."""
         kl = self.client.klines(symbol, CANDLE_INTERVAL, limit=300)
         if not kl:
             raise RuntimeError(f"empty kline response for {symbol}")
-        k = Klines(kl)
+        k = Klines(kl).closed()
+        if not k:
+            raise RuntimeError(f"no closed candles for {symbol}")
         issues = k.validate()
         if issues:
             log.warning("%s kline quality: %s", symbol, "; ".join(issues[:2]))
@@ -237,6 +242,9 @@ class Trader:
                 self._close_position(pos, price, plan.reason)
                 stats["exits"] += 1
                 continue
+            # Position survives: ratchets (trailing/breakeven) may have raised
+            # the journal SL above the armed exchange trigger - sync it up.
+            self._maybe_sync_exchange_stop(pos)
             try:
                 sig = self._consensus(symbol)
             except Exception as e:
@@ -247,9 +255,14 @@ class Trader:
                 self._close_position(pos, price, f"signal exit: {sig.reason}")
                 stats["exits"] += 1
 
+        # 1b) per-cycle reconciliation (live futures): journal vs exchange.
+        # Catches stops that fired while away and unknown manual positions.
+        self._reconcile_cycle(quotes)
+
         # 2) entries
-        if self.risk.tripped_today(mode):
-            log.warning("kill switch active for today - no new entries")
+        halted, why_halt = self.risk.halted(mode)
+        if halted:
+            log.warning("kill switch active for today - no new entries (%s)", why_halt)
         else:
             for symbol in self.cfg.symbols:
                 price = quotes.get(symbol)
@@ -291,6 +304,15 @@ class Trader:
                 f"[{mode.upper()}] DAILY LOSS CAP HIT - trading halted until tomorrow (UTC) "
                 f"(equity {total:.2f} {self.cfg.quote_asset})"
             )
+        if self.risk.check_consecutive_losses(mode):
+            self.notifier.kill_switch(
+                f"[{mode.upper()}] CONSECUTIVE LOSS HALT - trading halted until tomorrow (UTC)"
+            )
+        if self.risk.check_drawdown_halt(mode, total):
+            self.notifier.kill_switch(
+                f"[{mode.upper()}] DRAWDOWN HALT - trading halted until tomorrow (UTC) "
+                f"(equity {total:.2f} {self.cfg.quote_asset})"
+            )
         dt_ms = (time.time() - t0) * 1000
         self._cycle_ms.append(dt_ms)
         if len(self._cycle_ms) > 50:
@@ -320,16 +342,38 @@ class Trader:
         except Exception as e:
             log.error("BUY %s skipped: balance unavailable: %s", symbol, e)
             return False
-        amount = self.risk.position_size(price, cash)
-        if amount <= 0:
-            log.info("skip entry %s: insufficient funds (cash %.2f)", symbol, cash)
-            return False
+        # ATR fetch serves both ATR stops and risk-based sizing (one fetch).
         atr_val = None
-        if self.cfg.risk.atr_stops:
+        if self.cfg.risk.atr_stops or self.cfg.risk.risk_per_trade_pct > 0:
             try:
                 atr_val = self._atr(self._df(symbol))
             except Exception as e:
                 log.warning("ATR fetch failed for %s: %s (using fixed %%)", symbol, e)
+        amount = self.risk.position_size(price, cash)
+        if self.cfg.risk.risk_per_trade_pct > 0:
+            preview = self.risk.entry_levels(price, atr_val)
+            budget_cap = min(self.cfg.risk.quote_budget * self.cfg.risk.per_trade_pct / 100.0, cash)
+            sized = self.risk.risk_size(
+                self.cfg.risk,
+                price,
+                preview["stop_loss"],
+                cash,
+                leverage=self.cfg.leverage if self.cfg.market == "futures" else 1,
+                max_margin=budget_cap,
+            )
+            if sized is not None:
+                # Broker amount semantics: margin for futures, notional for spot.
+                amount = sized["margin"] if self.cfg.market == "futures" else sized["notional"]
+                log.info(
+                    "%s risk-sized: risk %.2f%% -> qty %.6f (margin %.2f)",
+                    symbol,
+                    self.cfg.risk.risk_per_trade_pct,
+                    sized["qty"],
+                    sized["margin"],
+                )
+        if amount <= 0:
+            log.info("skip entry %s: insufficient funds (cash %.2f)", symbol, cash)
+            return False
         try:
             fill = self.broker.buy_market(symbol, amount, price)
         except Exception as e:
@@ -355,9 +399,7 @@ class Trader:
             log.error("JOURNAL FAILED after BUY %s fill @ %s: %s", symbol, fill["price"], e)
             self.notifier.error(f"[{mode}] BUY {symbol} filled but JOURNAL FAILED: {e}")
             return False
-        self._arm_exchange_stops(
-            symbol, fill["qty"], levels["stop_loss"], levels["take_profit"], pos_id
-        )
+        self._arm_exchange_stops(symbol, levels["stop_loss"], levels["take_profit"], pos_id)
         self.risk.note_entry(symbol)
         try:
             self.store.insert_trade(
@@ -399,12 +441,7 @@ class Trader:
 
     # ---------------- exchange safety net ----------------
     def _arm_exchange_stops(
-        self,
-        symbol: str,
-        qty: float,
-        stop_loss: float | None,
-        take_profit: float | None,
-        pos_id: int,
+        self, symbol: str, stop_loss: float | None, take_profit: float | None, pos_id: int
     ) -> None:
         """Place exchange-native STOP/TP (live futures only). Non-fatal:
         on failure the position stays protected by bot-side risk only."""
@@ -413,16 +450,17 @@ class Trader:
         if not isinstance(self.broker, FuturesBroker):
             return
         try:
-            ids = self.broker.place_protection_orders(
-                symbol, qty, stop_loss or 0.0, take_profit or 0.0
-            )
+            ids = self.broker.place_protection_orders(symbol, stop_loss or 0.0, take_profit or 0.0)
         except Exception as e:
             log.error("exchange stops FAILED for %s (bot-side only): %s", symbol, e)
             self.notifier.error(f"[{self.cfg.mode}] {symbol} exchange stops FAILED: {e}")
             return
         try:
             self.store.update_protection_orders(
-                pos_id, ids.get("stop_order_id"), ids.get("take_order_id")
+                pos_id,
+                ids.get("stop_order_id"),
+                ids.get("take_order_id"),
+                stop_trigger=ids.get("stop_trigger"),
             )
         except Exception as e:
             log.error("protection journal failed for %s: %s", symbol, e)
@@ -438,6 +476,123 @@ class Trader:
             self.broker.cancel_protection_orders(pos["symbol"], oids)
         except Exception as e:
             log.warning("cancel protection failed for %s: %s", pos["symbol"], e)
+
+    def _maybe_sync_exchange_stop(self, snapshot: dict) -> None:
+        """Push a ratcheted journal SL up to the exchange (live futures only).
+
+        Compares the fresh journal SL against the stored armed trigger; on a
+        meaningful raise, places a new STOP then cancels the old (never
+        unprotected). Failures are non-fatal: bot-side SL still enforces.
+        """
+        if not self.cfg.exchange_stops or self.cfg.mode != "live":
+            return
+        if not isinstance(self.broker, FuturesBroker):
+            return
+        try:
+            fresh = self.store.get_open_position(snapshot["symbol"], self.cfg.mode)
+        except Exception as e:
+            log.warning("sync read failed for %s: %s", snapshot.get("symbol"), e)
+            return
+        if not fresh or not fresh.get("stop_order_id"):
+            return
+        try:
+            journal_sl = float(fresh["stop_loss"]) if fresh.get("stop_loss") else 0.0
+        except (TypeError, ValueError):
+            return
+        if journal_sl <= 0:
+            return
+        old_trigger = fresh.get("exchange_stop_price")
+        try:
+            old_trigger = float(old_trigger) if old_trigger is not None else 0.0
+        except (TypeError, ValueError):
+            old_trigger = 0.0
+        base = max(old_trigger, float(snapshot.get("stop_loss") or 0.0))
+        if journal_sl <= base + 1e-9:
+            return  # no meaningful raise since the armed trigger
+        try:
+            res = self.broker.replace_protection_stop(
+                fresh["symbol"], fresh.get("stop_order_id"), journal_sl
+            )
+        except Exception as e:
+            log.error(
+                "exchange stop sync FAILED for %s (bot-side SL %.6g still guards): %s",
+                fresh["symbol"],
+                journal_sl,
+                e,
+            )
+            return
+        try:
+            self.store.update_protection_orders(
+                fresh["id"],
+                res.get("algo_id"),
+                fresh.get("take_order_id"),
+                stop_trigger=res.get("trigger"),
+            )
+        except Exception as e:
+            log.error("sync journal failed for %s: %s", fresh["symbol"], e)
+            return
+        log.info(
+            "%s exchange stop synced %.6g -> %.6g (algo %s)",
+            fresh["symbol"],
+            old_trigger,
+            res.get("trigger"),
+            res.get("algo_id"),
+        )
+
+    # Fresh fills need a grace window: testnet fill reporting lags, so a
+    # position younger than this is never reconciled away.
+    RECONCILE_GRACE_MIN = 10.0
+
+    def _reconcile_cycle(self, quotes: dict[str, float]) -> None:
+        """Per-cycle journal-vs-exchange audit (live futures only, #12).
+
+        - Journal-open but exchange-flat (and older than grace): reconcile-close.
+        - Exchange-open but journal-flat on a watchlist symbol: alert once/day
+          (manual position - never auto-managed, never auto-closed).
+        """
+        if self.cfg.mode != "live" or not isinstance(self.broker, FuturesBroker):
+            return
+        try:
+            risks = self.client.futures_position_risk()
+        except Exception as e:
+            log.warning("reconcile scan failed: %s", e)
+            return
+        amts: dict[str, float] = {}
+        for r in risks or []:
+            try:
+                amt = abs(float(r.get("positionAmt", 0) or 0))
+            except (TypeError, ValueError):
+                continue
+            if r.get("symbol"):
+                amts[r["symbol"]] = amt
+        mode = self.cfg.mode
+        journal_syms = set()
+        for pos in self.store.open_positions(mode):
+            sym = pos["symbol"]
+            journal_syms.add(sym)
+            if amts.get(sym, 0.0) > 0:
+                continue
+            age = RiskManager._position_age_min(pos)
+            if age is not None and age < self.RECONCILE_GRACE_MIN:
+                continue
+            price = quotes.get(sym, pos["entry_price"])
+            if self._reconcile_flat(pos, price):
+                log.info("%s ghost position reconciled (exchange flat)", sym)
+        for sym, amt in amts.items():
+            if amt <= 0 or sym in journal_syms or sym not in self.cfg.symbols:
+                continue
+            key = f"unknownpos:{mode}:{sym}:{self.risk._today_key()}"
+            try:
+                if self.store.get_meta(key) == "1":
+                    continue
+                self.store.set_meta(key, "1")
+            except Exception:
+                pass
+            self.notifier.send(
+                f"[{mode.upper()}] UNKNOWN exchange position {sym} amt={amt:g} "
+                "(manual entry? NOT managed, NOT auto-closed)",
+                event="warning",
+            )
 
     def _reconcile_flat(self, pos: dict, price: float) -> bool:
         """Journal-close when the exchange shows no position.
@@ -604,11 +759,7 @@ class Trader:
                     continue
                 log.info("arming exchange stops for restored %s", pos["symbol"])
                 self._arm_exchange_stops(
-                    pos["symbol"],
-                    pos["qty"],
-                    pos.get("stop_loss"),
-                    pos.get("take_profit"),
-                    pos["id"],
+                    pos["symbol"], pos.get("stop_loss"), pos.get("take_profit"), pos["id"]
                 )
 
     def run_forever(self) -> None:

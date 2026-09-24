@@ -107,16 +107,20 @@ environment your key works in.
 Each cycle (`trading.update_interval_sec`, default 60 s):
 
 1. **Data** — latest 15m close per symbol (batch `ticker/prices` with
-   per-symbol fallback; stale-quote warning beyond ~17 min).
-2. **Exits first** — hard SL → TP → trailing ratchet → unanimous-SELL
-   signal exit. Every open position, every cycle.
+   per-symbol fallback; stale-quote warning beyond ~17 min). **Signals use
+   closed candles only** (forming bar dropped) so live matches the backtest;
+   exits use the latest price.
+2. **Exits first** — breakeven lock → hard SL → TP → trailing ratchet →
+   time stop → unanimous-SELL signal exit. Every open position, every cycle.
+   Ratchets also sync up to the exchange stop (place-new-then-cancel).
 3. **Entries** — strategies vote; `min_votes` threshold + SELL veto →
-   gates (max positions, kill switch, daily budget, cooldown) →
-   size = `per_trade_pct` of budget (capped by free balance, ≥ 10 USDT),
-   leverage-scaled notional on futures, exchange-filter-clamped →
-   market fill → journal + alert.
-4. **Bookkeeping** — equity snapshot, kill-switch evaluation, heartbeat,
-   cycle timing log.
+   gates (max positions, kill-switch trio, daily budget, cooldown) →
+   size = `risk_per_trade_pct` of equity by SL distance, capped by the
+   `per_trade_pct` budget (≥ 10 USDT), leverage-scaled notional on futures,
+   exchange-filter-clamped → market fill → exchange stops armed → journal.
+4. **Bookkeeping** — per-cycle journal-vs-exchange reconciliation (flat
+   ghosts closed, unknown manual positions alerted once/day), equity
+   snapshot, kill-switch evaluation, heartbeat, cycle timing log.
 
 ```
       ┌─────────┐   15m closes   ┌────────────┐  BUY/SELL/HOLD  ┌───────────┐
@@ -153,6 +157,9 @@ risk:
   breakeven_trigger_pct: 2.0 # lock SL to entry+buffer once up 2% (0 = off)
   breakeven_buffer_pct: 0.1
   max_hold_min: 0          # time-stop: flat-exit stale positions (0 = off)
+  consecutive_loss_halt: 3 # halt day after 3 straight losing closes (0 = off)
+  max_drawdown_halt_pct: 10.0 # halt day after -10% vs peak equity (0 = off)
+  risk_per_trade_pct: 1.0  # risk 1% equity/trade by SL distance, capped by budget
   cooldown_min: 30
   atr_stops: false          # true = SL/TP from ATR (adapts to volatility)
   atr_sl_mult: 2.0
@@ -264,7 +271,7 @@ optimization for Termux. `data/glm.db` is portable PC ↔ phone.
 
 ```bash
 pip install -r requirements-dev.txt
-python tests.py          # 46 unit tests, no network
+python tests.py          # 74 unit tests, no network
 make lint | make typecheck
 ```
 

@@ -59,6 +59,21 @@ class Klines:
         k.n = older.n + newer.n
         return k
 
+    def closed(self) -> Klines:
+        """Return klines without the last (still-forming) candle.
+
+        Live endpoints always append the in-progress bar; strategies must
+        evaluate on closed bars only, or live signals repaint and diverge
+        from the backtest (which uses settled history).
+        """
+        if self.n <= 1:
+            return Klines()
+        k = Klines()
+        for f in ("open_time", "open", "high", "low", "close", "volume"):
+            setattr(k, f, list(getattr(self, f))[:-1])
+        k.n = self.n - 1
+        return k
+
     def drop_duplicates_by_time(self) -> Klines:
         """Deduplicate on open_time, keeping the NEWEST row on conflicts."""
         seen = set()

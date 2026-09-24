@@ -65,6 +65,12 @@ class RiskCfg:
         portfolios; 1 = current single-position behaviour.
       - ``slippage_bps``: backtest / paper slippage in basis points (0 = none).
       - ``max_hold_min``: 0 = disabled; else exit a stale position after N minutes.
+      - ``consecutive_loss_halt``: halt new entries for the UTC day after N
+        straight losing closes (0 = disabled).
+      - ``max_drawdown_halt_pct``: halt new entries for the UTC day after peak
+        equity drawdown reaches N% (0 = disabled).
+      - ``risk_per_trade_pct``: size positions to risk N% of equity (SL-distance
+        based), capped by ``per_trade_pct`` budget (0 = legacy budget sizing).
     Breakeven is ON by default (2% move locks the stop to entry + 0.1%).
     """
 
@@ -87,6 +93,9 @@ class RiskCfg:
     breakeven_trigger_pct: float = 2.0  # 0 = disabled; else lock SL at entry+buffer
     breakeven_buffer_pct: float = 0.1
     max_hold_min: int = 0  # 0 = disabled; else exit positions older than N minutes
+    consecutive_loss_halt: int = 3  # 0 = disabled; else halt day after N straight losses
+    max_drawdown_halt_pct: float = 10.0  # 0 = disabled; else halt day after N% peak DD
+    risk_per_trade_pct: float = 1.0  # 0 = legacy; else risk N% equity, capped by budget
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> RiskCfg:
@@ -111,6 +120,9 @@ class RiskCfg:
                 breakeven_trigger_pct=float(d.get("breakeven_trigger_pct", 2.0)),
                 breakeven_buffer_pct=float(d.get("breakeven_buffer_pct", 0.1)),
                 max_hold_min=int(d.get("max_hold_min", 0)),
+                consecutive_loss_halt=int(d.get("consecutive_loss_halt", 3)),
+                max_drawdown_halt_pct=float(d.get("max_drawdown_halt_pct", 10.0)),
+                risk_per_trade_pct=float(d.get("risk_per_trade_pct", 1.0)),
             )
         except KeyError as e:
             raise ConfigError(f"risk section missing required key: {e}") from e
@@ -149,6 +161,12 @@ class RiskCfg:
             errs.append("risk.breakeven_buffer_pct must be >= 0")
         if self.max_hold_min < 0:
             errs.append("risk.max_hold_min must be >= 0 (0 disables)")
+        if self.consecutive_loss_halt < 0:
+            errs.append("risk.consecutive_loss_halt must be >= 0 (0 disables)")
+        if self.max_drawdown_halt_pct < 0:
+            errs.append("risk.max_drawdown_halt_pct must be >= 0 (0 disables)")
+        if not 0 <= self.risk_per_trade_pct <= 100:
+            errs.append("risk.risk_per_trade_pct must be in [0, 100] (0 disables)")
         return errs
 
 
@@ -267,6 +285,9 @@ class BotConfig:
                 "breakeven_trigger_pct": self.risk.breakeven_trigger_pct,
                 "breakeven_buffer_pct": self.risk.breakeven_buffer_pct,
                 "max_hold_min": self.risk.max_hold_min,
+                "consecutive_loss_halt": self.risk.consecutive_loss_halt,
+                "max_drawdown_halt_pct": self.risk.max_drawdown_halt_pct,
+                "risk_per_trade_pct": self.risk.risk_per_trade_pct,
             },
             "config_path": self.config_path,
         }

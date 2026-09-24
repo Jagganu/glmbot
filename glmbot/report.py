@@ -71,6 +71,13 @@ def status_dict(cfg, store: Store, client, positions: list[dict]) -> dict[str, A
             break
         day_open = r["total"]
     day_pnl = (equity - day_open) if (equity is not None and day_open) else 0.0
+    halted, halt_reason = False, ""
+    try:
+        from .risk import RiskManager
+
+        halted, halt_reason = RiskManager(cfg.risk, store).halted(cfg.mode)
+    except Exception:
+        pass
     return {
         "mode": cfg.mode,
         "market": cfg.market,
@@ -80,13 +87,8 @@ def status_dict(cfg, store: Store, client, positions: list[dict]) -> dict[str, A
         "unrealized_pnl": round(unreal, 2),
         "equity": equity,
         "day_pnl": round(day_pnl, 2),
-        "kill_switch": bool(
-            getattr(cfg, "risk", None)
-            and store.get_meta(
-                f"killswitch:{cfg.mode}:{__import__('datetime').datetime.now(__import__('datetime').timezone.utc).strftime('%Y-%m-%d')}"
-            )
-            == "1"
-        ),
+        "kill_switch": halted,
+        "kill_reason": halt_reason,
     }
 
 
@@ -103,7 +105,7 @@ def show_status(cfg, store: Store, client, positions: list[dict]) -> None:
             f"({d['day_pnl']:+.2f}) | unrealized {d['unrealized_pnl']:+.2f}"
         )
     if d["kill_switch"]:
-        _console.print("[red bold]!! daily loss kill switch ACTIVE - no new entries today[/]")
+        _console.print(f"[red bold]!! halted - no new entries today ({d['kill_reason']})[/]")
     if not positions:
         _console.print("[dim]no open positions[/dim]")
         return

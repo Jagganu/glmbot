@@ -767,7 +767,7 @@ class TestProtectionClient(unittest.TestCase):
 
     def test_place_protection_stop_payload(self):
         c = self._client()
-        res = c.place_protection_stop("BNBUSDT", "SELL", "0.05", "778.13", "STOP_MARKET")
+        res = c.place_protection_stop("BNBUSDT", "SELL", "778.13", "STOP_MARKET")
         self.assertEqual(res["algoId"], 111)
         method, url, kw = c.s.calls[-1]
         self.assertEqual(method, "POST")
@@ -782,7 +782,7 @@ class TestProtectionClient(unittest.TestCase):
 
     def test_place_take_profit_payload(self):
         c = self._client()
-        res = c.place_protection_stop("BNBUSDT", "SELL", "0.05", "821.45", "TAKE_PROFIT_MARKET")
+        res = c.place_protection_stop("BNBUSDT", "SELL", "821.45", "TAKE_PROFIT_MARKET")
         self.assertEqual(res["algoId"], 222)
 
     def test_cancel_and_open_orders(self):
@@ -832,8 +832,8 @@ class _StubFuturesClient:
         self.calls.append(("leverage", symbol, leverage))
         return {"leverage": leverage}
 
-    def place_protection_stop(self, symbol, side, quantity, stop_price, kind):
-        self.calls.append(("protect", symbol, side, quantity, stop_price, kind))
+    def place_protection_stop(self, symbol, side, stop_price, kind):
+        self.calls.append(("protect", symbol, side, stop_price, kind))
         oid = 111 if kind == "STOP_MARKET" else 222
         return {"algoId": oid, "status": "NEW"}
 
@@ -853,12 +853,19 @@ class TestFuturesProtectionBroker(unittest.TestCase):
 
     def test_place_rounds_to_tick(self):
         b = self._broker()
-        ids = b.place_protection_orders("BNBUSDT", 0.05, 778.134, 821.459)
-        self.assertEqual(ids, {"stop_order_id": 111, "take_order_id": 222})
+        ids = b.place_protection_orders("BNBUSDT", 778.134, 821.459)
+        self.assertEqual(
+            ids,
+            {
+                "stop_order_id": 111,
+                "take_order_id": 222,
+                "stop_trigger": 778.13,
+                "take_trigger": 821.46,
+            },
+        )
         protects = [c for c in b.client.calls if c[0] == "protect"]
-        self.assertEqual(protects[0][3], "0.05")  # qty passed through
-        self.assertEqual(protects[0][4], "778.13")  # tick-rounded down
-        self.assertEqual(protects[1][4], "821.46")  # tick-rounded half-up
+        self.assertEqual(protects[0][3], "778.13")  # tick-rounded down
+        self.assertEqual(protects[1][3], "821.46")  # tick-rounded half-up
 
     def test_cancel_best_effort(self):
         b = self._broker()
@@ -946,8 +953,314 @@ class TestReconcileFlat(unittest.TestCase):
             store = Store(os.path.join(tmp, "t.db"))
             client = BinanceClient("", "", testnet=True)
             trader = Trader(cfg, store, client, PaperBroker(client, 1000.0), Notifier({}, {}))
-            trader._arm_exchange_stops("BTCUSDT", 0.002, 980.0, 1040.0, 1)  # no raise
+            trader._arm_exchange_stops("BTCUSDT", 980.0, 1040.0, 1)  # no raise
             self.assertEqual(len(store.open_positions("paper")), 0)
+
+
+class TestKlinesClosed(unittest.TestCase):
+    def test_drops_forming_bar(self):
+        k = Klines.from_lists(close=[1.0, 2.0, 3.0, 4.0, 5.0])
+        c = k.closed()
+        self.assertEqual(len(c), 4)
+        self.assertEqual(c.close[-1], 4.0)
+        self.assertEqual(len(k), 5)  # original untouched
+
+    def test_empty_and_single(self):
+        self.assertEqual(len(Klines().closed()), 0)
+        self.assertEqual(len(Klines.from_lists(close=[1.0]).closed()), 0)
+
+
+class TestKillSwitches(unittest.TestCase):
+    def _rm(self, tmp):
+        cfg = make_cfg()
+        store = Store(os.path.join(tmp, "t.db"))
+        return RiskManager(cfg.risk, store), store
+
+    def _close(self, store, symbol, pnl):
+        pid = store.open_position(
+            {
+                "symbol": symbol,
+                "strategy": "ema_cross",
+                "entry_price": 100.0,
+                "qty": 1.0,
+                "mode": "paper",
+            }
+        )
+        store.close_position(pid, 100.0, pnl)
+
+    def test_consecutive_losses_trip_and_block(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rm, store = self._rm(tmp)  # halt after 3 straight losses
+            self._close(store, "AAA", -5.0)
+            self._close(store, "BBB", -3.0)
+            self.assertFalse(rm.check_consecutive_losses("paper"))
+            self._close(store, "CCC", -1.0)
+            self.assertTrue(rm.check_consecutive_losses("paper"))
+            ok, why = rm.can_open("DDD", "paper")
+            self.assertFalse(ok)
+            self.assertIn("consecutive", why)
+            halted, reason = rm.halted("paper")
+            self.assertTrue(halted)
+            self.assertIn("consecutive", reason)
+
+    def test_win_breaks_streak(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rm, store = self._rm(tmp)
+            self._close(store, "AAA", -5.0)
+            self._close(store, "BBB", -3.0)
+            self._close(store, "CCC", 10.0)  # most recent: winner
+            self.assertFalse(rm.check_consecutive_losses("paper"))
+            self.assertTrue(rm.can_open("DDD", "paper")[0])
+
+    def test_consecutive_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rm, store = self._rm(tmp)
+            rm.cfg.consecutive_loss_halt = 0
+            for s in ("AAA", "BBB", "CCC", "DDD", "EEE"):
+                self._close(store, s, -5.0)
+            self.assertFalse(rm.check_consecutive_losses("paper"))
+
+    def test_drawdown_trips_and_blocks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rm, store = self._rm(tmp)  # halt at -10% vs peak
+            store.snapshot_equity("paper", 1000.0, 0.0)
+            self.assertFalse(rm.check_drawdown_halt("paper", 950.0))
+            store.snapshot_equity("paper", 800.0, 0.0)
+            self.assertTrue(rm.check_drawdown_halt("paper", 800.0))
+            ok, why = rm.can_open("DDD", "paper")
+            self.assertFalse(ok)
+            self.assertIn("drawdown", why)
+
+    def test_drawdown_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rm, store = self._rm(tmp)
+            rm.cfg.max_drawdown_halt_pct = 0.0
+            store.snapshot_equity("paper", 1000.0, 0.0)
+            self.assertFalse(rm.check_drawdown_halt("paper", 100.0))
+
+
+class TestRiskSizing(unittest.TestCase):
+    def _rm(self, tmp):
+        cfg = make_cfg()
+        store = Store(os.path.join(tmp, "t.db"))
+        return RiskManager(cfg.risk, store)
+
+    def test_futures_sizes_by_risk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rm = self._rm(tmp)
+            # risk 1% of 1000 = 10 over a 2.0 SL distance -> 5 units, 250 margin
+            out = RiskManager.risk_size(rm.cfg, 100.0, 98.0, 1000.0, leverage=2)
+            self.assertAlmostEqual(out["qty"], 5.0)
+            self.assertAlmostEqual(out["margin"], 250.0)
+            self.assertAlmostEqual(out["notional"], 500.0)
+
+    def test_cap_binds_wide_stops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rm = self._rm(tmp)
+            out = RiskManager.risk_size(rm.cfg, 100.0, 98.0, 1000.0, leverage=2, max_margin=20.0)
+            self.assertAlmostEqual(out["margin"], 20.0)
+            self.assertAlmostEqual(out["qty"], 0.4)
+
+    def test_spot_margin_equals_notional(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rm = self._rm(tmp)
+            out = RiskManager.risk_size(rm.cfg, 100.0, 98.0, 1000.0, leverage=1)
+            self.assertAlmostEqual(out["qty"], 5.0)
+            self.assertAlmostEqual(out["margin"], 500.0)
+
+    def test_degenerate_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rm = self._rm(tmp)
+            self.assertIsNone(RiskManager.risk_size(rm.cfg, 100.0, 100.0, 1000.0, leverage=2))
+            self.assertIsNone(RiskManager.risk_size(rm.cfg, 100.0, 101.0, 1000.0, leverage=2))
+            rm.cfg.risk_per_trade_pct = 0.0
+            self.assertIsNone(RiskManager.risk_size(rm.cfg, 100.0, 98.0, 1000.0, leverage=2))
+            rm.cfg.risk_per_trade_pct = 1.0
+            self.assertIsNone(RiskManager.risk_size(rm.cfg, 100.0, 98.0, 10.0, leverage=2))
+
+
+class TestTrailingSync(unittest.TestCase):
+    def _trader(self, tmp):
+        cfg = make_cfg(mode="live", strategies=["ema_cross"])
+        cfg.market = "futures"
+        cfg.leverage = 2
+        store = Store(os.path.join(tmp, "t.db"))
+        client = _StubFuturesClient()
+        broker = FuturesBroker(client, leverage=2)
+        return Trader(cfg, store, client, broker, Notifier({}, {})), store, client
+
+    def _open_armed(self, store, sl=98.0):
+        pid = store.open_position(
+            {
+                "symbol": "BNBUSDT",
+                "strategy": "ema_cross",
+                "entry_price": 100.0,
+                "qty": 0.05,
+                "stop_loss": sl,
+                "take_profit": 104.0,
+                "mode": "live",
+            }
+        )
+        store.update_protection_orders(pid, 100, 200, stop_trigger=98.0)
+        return pid
+
+    def test_sync_replaces_on_raise(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trader, store, client = self._trader(tmp)
+            pid = self._open_armed(store)
+            with store._conn() as c:  # trailing ratcheted the journal SL
+                c.execute("UPDATE positions SET stop_loss=? WHERE id=?", (101.0, pid))
+            snapshot = {"symbol": "BNBUSDT", "stop_loss": 98.0}
+            trader._maybe_sync_exchange_stop(snapshot)
+            replaces = [c for c in client.calls if c[0] == "protect"]
+            self.assertEqual(len(replaces), 1)  # new STOP placed...
+            cancels = [c for c in client.calls if c[0] == "cancel"]
+            self.assertEqual(cancels, [("cancel", "BNBUSDT", 100)])  # ...old cancelled
+            pos = store.get_open_position("BNBUSDT", "live")
+            self.assertEqual(pos["stop_order_id"], "111")
+            self.assertAlmostEqual(pos["exchange_stop_price"], 101.0)
+
+    def test_sync_skips_without_raise(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trader, store, client = self._trader(tmp)
+            self._open_armed(store)
+            snapshot = {"symbol": "BNBUSDT", "stop_loss": 98.0}
+            trader._maybe_sync_exchange_stop(snapshot)
+            self.assertEqual([c for c in client.calls if c[0] == "protect"], [])
+
+    def test_sync_failure_keeps_old(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trader, store, client = self._trader(tmp)
+            pid = self._open_armed(store)
+            with store._conn() as c:
+                c.execute("UPDATE positions SET stop_loss=? WHERE id=?", (101.0, pid))
+
+            def boom(*a, **k):
+                raise BinanceError(500, -1000, "exchange down")
+
+            client.place_protection_stop = boom
+            snapshot = {"symbol": "BNBUSDT", "stop_loss": 98.0}
+            trader._maybe_sync_exchange_stop(snapshot)  # must not raise
+            pos = store.get_open_position("BNBUSDT", "live")
+            self.assertEqual(pos["stop_order_id"], "100")  # old order kept
+
+
+class _CycleClient:
+    """Full-loop stub: flat market, scripted position risk, rich balance."""
+
+    market = "futures"
+
+    def __init__(self, risk_rows):
+        self._risk_rows = risk_rows
+
+    def ticker_prices(self, symbols):
+        return dict.fromkeys(symbols, 100.0)
+
+    def klines(self, symbol, interval="15m", limit=300, end_time=None):
+        base = 1_700_000_000_000
+        return [
+            {
+                "open_time": base + i * 900000,
+                "open": 100.0,
+                "high": 100.1,
+                "low": 99.9,
+                "close": 100.0,
+                "volume": 10.0,
+                "close_time": base + i * 900000 + 899999,
+            }
+            for i in range(300)
+        ]
+
+    def futures_position_risk(self, symbol=None):
+        rows = self._risk_rows
+        if symbol:
+            rows = [r for r in rows if r.get("symbol") == symbol]
+        return rows
+
+    def futures_balance(self):
+        return {"free": 10000.0, "total": 10000.0}
+
+
+class _SpyNotifier(Notifier):
+    def __init__(self):
+        super().__init__({}, {})
+        self.sent = []
+
+    def send(self, text, event="info"):
+        self.sent.append((event, text))
+
+
+class TestReconcileCycle(unittest.TestCase):
+    def _trader(self, tmp, risk_rows, symbols=("BNBUSDT", "ETHUSDT")):
+        cfg = make_cfg(mode="live", strategies=["ema_cross"])
+        cfg.market = "futures"
+        cfg.leverage = 2
+        cfg.symbols = list(symbols)
+        store = Store(os.path.join(tmp, "t.db"))
+        client = _CycleClient(risk_rows)
+        broker = FuturesBroker(client, leverage=2)
+        notifier = _SpyNotifier()
+        return Trader(cfg, store, client, broker, notifier), store, notifier
+
+    def _old_ghost(self, store):
+        pid = store.open_position(
+            {
+                "symbol": "BNBUSDT",
+                "strategy": "ema_cross",
+                "entry_price": 100.0,
+                "qty": 0.05,
+                "stop_loss": 90.0,
+                "take_profit": 200.0,
+                "mode": "live",
+            }
+        )
+        with store._conn() as c:
+            c.execute("UPDATE positions SET opened_ts=? WHERE id=?", ("2020-01-01T00:00:00Z", pid))
+
+    def test_ghost_reconciled_and_unknown_flagged_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            risk = [
+                {"symbol": "BNBUSDT", "positionAmt": "0"},
+                {"symbol": "ETHUSDT", "positionAmt": "0.5"},
+            ]
+            trader, store, notifier = self._trader(tmp, risk)
+            self._old_ghost(store)
+            trader.run_once()
+            self.assertIsNone(store.get_open_position("BNBUSDT", "live"))
+            trades = store.trades(mode="live")
+            self.assertTrue(trades and trades[0]["reason"].startswith("reconciled"))
+            warns = [t for ev, t in notifier.sent if ev == "warning"]
+            self.assertEqual(len(warns), 1)
+            self.assertIn("ETHUSDT", warns[0])
+            trader.run_once()  # throttled: still exactly one warning
+            self.assertEqual(len([t for ev, t in notifier.sent if ev == "warning"]), 1)
+
+    def test_matching_position_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            risk = [{"symbol": "BNBUSDT", "positionAmt": "0.05"}]
+            trader, store, notifier = self._trader(tmp, risk, symbols=("BNBUSDT",))
+            self._old_ghost(store)
+            trader.run_once()
+            self.assertIsNotNone(store.get_open_position("BNBUSDT", "live"))
+            self.assertEqual(notifier.sent, [])
+
+    def test_fresh_ghost_gets_grace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            risk = [{"symbol": "BNBUSDT", "positionAmt": "0"}]
+            trader, store, notifier = self._trader(tmp, risk, symbols=("BNBUSDT",))
+            store.open_position(  # opened just now -> within grace window
+                {
+                    "symbol": "BNBUSDT",
+                    "strategy": "ema_cross",
+                    "entry_price": 100.0,
+                    "qty": 0.05,
+                    "stop_loss": 90.0,
+                    "take_profit": 200.0,
+                    "mode": "live",
+                }
+            )
+            trader.run_once()
+            self.assertIsNotNone(store.get_open_position("BNBUSDT", "live"))
 
 
 if __name__ == "__main__":
