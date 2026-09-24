@@ -451,10 +451,13 @@ def cmd_test_connection(args) -> int:
 def cmd_backtest(args) -> int:
     cfg = _load(args)
     client = _client(cfg)
+    if args.ablate and args.folds > 1:
+        console.print("[red]use either --ablate or --folds, not both[/red]")
+        return 1
 
-    from glmbot.backtest import Backtester
+    from glmbot.backtest import Backtester, fold_splits, summarize_run
     from glmbot.klines import Klines
-    from glmbot.report import export_backtest_csv, show_backtest
+    from glmbot.report import export_backtest_csv, show_ablation, show_backtest, show_folds
 
     if not args.json:
         console.print(f"Loading {args.days}d of 15m candles for {len(cfg.symbols)} symbols...")
@@ -488,7 +491,91 @@ def cmd_backtest(args) -> int:
         klines[sym] = k
         if not args.json:
             console.print(f"  OK {sym}: {len(k)} candles" + " " * 20)
-    bt = Backtester(cfg, klines)
+
+    # ---- funding history, futures only (#19) ----
+    funding: dict[str, list] = {}
+    if cfg.market == "futures":
+        for sym, k in klines.items():
+            if not len(k):
+                continue
+            try:
+                funding[sym] = client.funding_history(sym, k.open_time[0], k.open_time[-1])
+                if not args.json:
+                    console.print(f"  OK {sym}: {len(funding[sym])} funding events")
+            except Exception as e:
+                console.print(f"  [yellow]! {sym} funding unavailable: {e}[/yellow]")
+                funding[sym] = []
+
+    # ---- walk-forward folds (#20) ----
+    if args.folds > 1:
+        ref_sym = cfg.symbols[0]
+        ref_folds = fold_splits(klines[ref_sym], args.folds)
+        fold_rows = []
+        for fi, (label, _refk) in enumerate(ref_folds):
+            per_fold = {}
+            for sym, k in klines.items():
+                folds = fold_splits(k, args.folds)
+                if fi < len(folds):
+                    per_fold[sym] = folds[fi][1]
+            if not per_fold:
+                continue
+            results = Backtester(cfg, per_fold, funding=funding).run()
+            s = summarize_run(results, cfg.risk.quote_budget)
+            bh = sum(r.buy_hold_pct for r in results.values()) / max(len(results), 1)
+            fold_rows.append(
+                {
+                    "label": label,
+                    "trades": s["trades"],
+                    "win_rate": s["win_rate"],
+                    "pnl_pct": s["pnl_pct"],
+                    "worst_max_dd": s["worst_max_dd"],
+                    "buy_hold_pct": bh,
+                }
+            )
+            if not args.json:
+                console.print(f"  OK {label}: {s['pnl_pct']:+.2f}%")
+        if args.json:
+            _print_json(fold_rows)
+        else:
+            show_folds(fold_rows)
+        return 0
+
+    # ---- ablation (#17) ----
+    if args.ablate:
+        import dataclasses
+
+        full = cfg.strategies
+        sets = [("full", "full", full)]
+        sets += [(f"no_{s}", "drop", [x for x in full if x != s]) for s in full]
+        sets += [(f"only_{s}", "single", [s]) for s in full]
+        rows = []
+        base_pnl = 0.0
+        for label, kind, active in sets:
+            if not active:
+                continue
+            sub = dataclasses.replace(cfg, strategies=list(active))
+            results = Backtester(sub, klines, funding=funding).run()
+            s = summarize_run(results, cfg.risk.quote_budget)
+            if kind == "full":
+                base_pnl = s["pnl_pct"]
+            rows.append(
+                {
+                    "label": f"{label} ({'+'.join(active)})",
+                    "kind": kind,
+                    "trades": s["trades"],
+                    "win_rate": s["win_rate"],
+                    "pnl_pct": s["pnl_pct"],
+                }
+            )
+            if not args.json:
+                console.print(f"  OK {label}: {s['pnl_pct']:+.2f}% ({int(s['trades'])} trades)")
+        if args.json:
+            _print_json({"base_pnl_pct": base_pnl, "rows": rows})
+        else:
+            show_ablation(rows, base_pnl)
+        return 0
+
+    bt = Backtester(cfg, klines, funding=funding)
     results = bt.run()
     if args.json:
         _print_json({s: r.to_dict() for s, r in results.items()})
@@ -723,6 +810,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("backtest", help="backtest strategies on watchlist")
     sp.add_argument("-d", "--days", type=int, default=7)
     sp.add_argument("--csv", default=None, help="write summary CSV to PATH (+ .trades.csv)")
+    sp.add_argument(
+        "--folds",
+        type=int,
+        default=1,
+        help="walk-forward folds across the period (regime-labelled bull/bear/chop)",
+    )
+    sp.add_argument(
+        "--ablate",
+        action="store_true",
+        help="strategy ablation: full set vs minus-one vs single runs",
+    )
     sp.set_defaults(fn=cmd_backtest)
 
     sp = sub.add_parser("run", help="start trading loop")

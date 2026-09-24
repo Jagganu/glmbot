@@ -626,6 +626,39 @@ class BinanceClient:
                 return {"msg": "unchanged"}
             raise
 
+    def funding_history(
+        self, symbol: str, start_ms: int | None = None, end_ms: int | None = None
+    ) -> list[tuple[int, float]]:
+        """Historical funding rates as sorted [(funding_time_ms, rate)].
+
+        Public endpoint, futures only (spot returns []). Paginates past the
+        1000-record limit. Positive rate = longs pay shorts.
+        """
+        if self.market != "futures":
+            return []
+        out: list[tuple[int, float]] = []
+        start = start_ms
+        while True:
+            params: dict[str, Any] = {"symbol": symbol, "limit": 1000}
+            if start is not None:
+                params["startTime"] = start
+            if end_ms is not None:
+                params["endTime"] = end_ms
+            j = self._retry(self._request, self.base, "/fapi/v1/fundingRate", params)
+            if not j:
+                break
+            for r in j:
+                try:
+                    out.append((int(r["fundingTime"]), float(r["fundingRate"])))
+                except (KeyError, ValueError, TypeError):
+                    continue
+            if len(j) < 1000:
+                break
+            start = int(j[-1]["fundingTime"]) + 1
+            if end_ms is not None and start >= end_ms:
+                break
+        return sorted(out)
+
 
 def json_dumps(x: Any) -> str:
     return _json.dumps(x)

@@ -96,6 +96,7 @@ class RiskCfg:
     consecutive_loss_halt: int = 3  # 0 = disabled; else halt day after N straight losses
     max_drawdown_halt_pct: float = 10.0  # 0 = disabled; else halt day after N% peak DD
     risk_per_trade_pct: float = 1.0  # 0 = legacy; else risk N% equity, capped by budget
+    stop_slippage_bps: float = 0.0  # extra adverse slippage on stop fills (backtest)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> RiskCfg:
@@ -123,6 +124,7 @@ class RiskCfg:
                 consecutive_loss_halt=int(d.get("consecutive_loss_halt", 3)),
                 max_drawdown_halt_pct=float(d.get("max_drawdown_halt_pct", 10.0)),
                 risk_per_trade_pct=float(d.get("risk_per_trade_pct", 1.0)),
+                stop_slippage_bps=float(d.get("stop_slippage_bps", 0.0)),
             )
         except KeyError as e:
             raise ConfigError(f"risk section missing required key: {e}") from e
@@ -167,6 +169,8 @@ class RiskCfg:
             errs.append("risk.max_drawdown_halt_pct must be >= 0 (0 disables)")
         if not 0 <= self.risk_per_trade_pct <= 100:
             errs.append("risk.risk_per_trade_pct must be in [0, 100] (0 disables)")
+        if self.stop_slippage_bps < 0:
+            errs.append("risk.stop_slippage_bps must be >= 0")
         return errs
 
 

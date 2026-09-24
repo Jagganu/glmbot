@@ -240,7 +240,9 @@ def show_equity(history: list[dict]) -> None:
 
 
 def show_backtest(results: dict[str, BTResult], starting: float) -> None:
-    table = Table(title="Backtest results (15m, 1-bar execution delay, fees + slippage)")
+    from .backtest import summarize_run
+
+    table = Table(title="Backtest (15m, 1-bar delay, intrabar stops, fees+slip+funding)")
     for col, just in (
         ("Symbol", "left"),
         ("Trades", "right"),
@@ -250,10 +252,10 @@ def show_backtest(results: dict[str, BTResult], starting: float) -> None:
         ("PF", "right"),
         ("Sharpe", "right"),
         ("Fees", "right"),
+        ("Fund", "right"),
         ("Final", "right"),
     ):
         table.add_column(col, justify=just)
-    total_final = 0.0
     for sym, r in sorted(results.items()):
         pf = "inf" if r.profit_factor == float("inf") else f"{r.profit_factor:.2f}"
         table.add_row(
@@ -265,25 +267,20 @@ def show_backtest(results: dict[str, BTResult], starting: float) -> None:
             pf,
             f"{r.sharpe:.2f}",
             f"{r.total_fees:.2f}",
+            f"{r.total_funding:+.2f}",
             fmt_money(r.final_equity),
         )
-        total_final += r.final_equity
     _console.print(table)
-    base = starting * max(len(results), 1)
-    pnl = (total_final / base - 1) * 100 if base else 0
-    # portfolio roll-up
-    all_trades = sum(r.n_trades for r in results.values())
-    all_wins = sum(r.n_wins for r in results.values())
-    wr = (all_wins / all_trades * 100) if all_trades else 0.0
-    worst_dd = max((r.max_drawdown_pct for r in results.values()), default=0.0)
+    s = summarize_run(results, starting)
     _console.print(
         Panel(
-            f"Symbols: {len(results)} | trades: {all_trades} | win rate: {wr:.0f}% | "
-            f"worst MaxDD: {worst_dd:.2f}%\n"
-            f"Sum of independent per-symbol runs: [bold]{fmt_money(total_final)}[/] "
-            f"({colored_pct(pnl)} vs {fmt_money(base)} allocated)\n"
-            f"[dim]Backtests != future results. Includes fees"
-            f"{' + slippage' if any(True for _ in [1]) else ''}; futures runs exclude funding/liquidation.[/]",
+            f"Symbols: {int(s['symbols'])} | trades: {int(s['trades'])} | "
+            f"win rate: {s['win_rate']:.0f}% | worst MaxDD: {s['worst_max_dd']:.2f}%\n"
+            f"Fees: {s['fees']:.2f} | funding: {s['funding']:+.2f}\n"
+            f"Sum of independent per-symbol runs: [bold]{fmt_money(s['final'])}[/] "
+            f"({colored_pct(s['pnl_pct'])} vs {fmt_money(s['allocated'])} allocated)\n"
+            "[dim]Backtests != future results. Conservative by design: intrabar "
+            "stops (SL-first), stop slippage, funding deducted.[/]",
             title="Portfolio",
         )
     )
@@ -305,6 +302,7 @@ def export_backtest_csv(results: dict[str, BTResult], path: str) -> str:
                 "sortino",
                 "expectancy",
                 "fees",
+                "funding",
                 "final_equity",
             ]
         )
@@ -321,7 +319,76 @@ def export_backtest_csv(results: dict[str, BTResult], path: str) -> str:
                     round(r.sortino, 2),
                     round(r.expectancy, 2),
                     round(r.total_fees, 2),
+                    round(r.total_funding, 2),
                     round(r.final_equity, 2),
                 ]
             )
     return path
+
+
+def show_folds(folds: list[dict]) -> None:
+    """Walk-forward table (#20): one row per fold with regime + consistency."""
+    table = Table(title="Walk-forward folds (chronological, regime-labelled)")
+    for col, just in (
+        ("Fold", "left"),
+        ("Trades", "right"),
+        ("Win%", "right"),
+        ("PnL%", "right"),
+        ("MaxDD%", "right"),
+        ("B&H%", "right"),
+    ):
+        table.add_column(col, justify=just)
+    pos = 0
+    for f in folds:
+        if f["pnl_pct"] > 0:
+            pos += 1
+        table.add_row(
+            f["label"],
+            str(int(f["trades"])),
+            f"{f['win_rate']:.0f}%",
+            colored_pct(f["pnl_pct"]),
+            f"{f['worst_max_dd']:.2f}",
+            colored_pct(f["buy_hold_pct"]),
+        )
+    _console.print(table)
+    _console.print(
+        Panel(
+            f"Profitable folds: [bold]{pos}/{len(folds)}[/] "
+            f"({(pos / len(folds) * 100) if folds else 0:.0f}%)\n"
+            "[dim]Edge needs green across bull, bear AND chop - one-regime "
+            "wonders don't survive.[/]",
+            title="Consistency",
+        )
+    )
+
+
+def show_ablation(rows: list[dict], base_pnl: float) -> None:
+    """Ablation table (#17): each row drops (or isolates) one strategy."""
+    table = Table(title="Strategy ablation (delta vs full set)")
+    for col, just in (
+        ("Set", "left"),
+        ("Trades", "right"),
+        ("Win%", "right"),
+        ("PnL%", "right"),
+        ("dPnL%", "right"),
+        ("Verdict", "left"),
+    ):
+        table.add_column(col, justify=just)
+    for r in rows:
+        delta = r["pnl_pct"] - base_pnl
+        if r["kind"] == "full":
+            verdict = "baseline"
+        elif r["kind"] == "drop":
+            verdict = "[green]KEEP[/]" if delta < 0 else "[red]drop candidate[/]"
+        else:
+            verdict = "standalone edge" if r["pnl_pct"] > 0 else "[dim]no edge alone[/]"
+        table.add_row(
+            r["label"],
+            str(int(r["trades"])),
+            f"{r['win_rate']:.0f}%",
+            colored_pct(r["pnl_pct"]),
+            colored_pct(delta) if r["kind"] != "full" else "-",
+            verdict,
+        )
+    _console.print(table)
+    _console.print("[dim]KEEP = removing it hurts. Drop candidates add cost without edge.[/]")

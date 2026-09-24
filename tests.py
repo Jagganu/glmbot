@@ -713,6 +713,13 @@ class _FakeSession:
         return self._record("DELETE", url, **kw)
 
     def _reply(self, method, url, kw):
+        if "fundingRate" in url:
+            return _FakeResp(
+                [
+                    {"fundingTime": 1000, "fundingRate": "0.0001"},
+                    {"fundingTime": 2000, "fundingRate": "-0.0002"},
+                ]
+            )
         if "openAlgoOrders" in url:
             return _FakeResp([{"algoId": 111, "symbol": "BNBUSDT"}])
         if "openOrders" in url:
@@ -795,6 +802,18 @@ class TestProtectionClient(unittest.TestCase):
         self.assertIn("signature=", url)
         self.assertEqual(c.open_algo_orders("BNBUSDT"), [{"algoId": 111, "symbol": "BNBUSDT"}])
         self.assertEqual(c.open_orders("BNBUSDT"), [])
+
+    def test_funding_history_parses(self):
+        c = self._client()
+        evts = c.funding_history("BTCUSDT", 0, 3000)
+        self.assertEqual(evts, [(1000, 0.0001), (2000, -0.0002)])
+        method, url, kw = c.s.calls[-1]
+        self.assertEqual(method, "GET")
+        self.assertIn("/fapi/v1/fundingRate", url)
+
+    def test_funding_history_spot_empty(self):
+        c = BinanceClient("k", "s", testnet=True, market="spot", session=_FakeSession())
+        self.assertEqual(c.funding_history("BTCUSDT", 0, 3000), [])
 
     def test_batch_symbols_compact_json(self):
         # Regression: pretty JSON (spaces) makes Binance reject the batch
@@ -1282,6 +1301,162 @@ class TestReconcileCycle(unittest.TestCase):
             )
             trader.run_once()
             self.assertIsNotNone(store.get_open_position("BNBUSDT", "live"))
+
+
+class TestIntrabarStops(unittest.TestCase):
+    """#18: a bar whose LOW pierces the stop exits even if its close recovers."""
+
+    def _cfg(self):
+        cfg = make_cfg(strategies=["bollinger"])
+        cfg.risk.trailing_stop_pct = 0.0
+        cfg.risk.breakeven_trigger_pct = 0.0
+        return cfg
+
+    def _klines(self, closes, lows=None, highs=None):
+        n = len(closes)
+        return Klines.from_lists(
+            close=closes,
+            high=list(highs) if highs else None,
+            low=list(lows) if lows else None,
+            volume=[100.0] * n,
+        )
+
+    def test_wick_through_stop_exits(self):
+        from glmbot.backtest import Backtester
+
+        closes = [100.0] * 60 + [94.0, 95.0, 96.0] + [96.0] * 10
+        lows = [c * 0.999 for c in closes]
+        highs = [c * 1.001 for c in closes]
+        lows[62] = 90.0  # crash bar: close 96 recovers, low pierces SL ~93.1
+        highs[62] = 97.0
+        k = self._klines(closes, lows, highs)
+        results = Backtester(self._cfg(), {"BTCUSDT": k}).run()
+        reasons = [t.reason for t in results["BTCUSDT"].trades if t.side == "SELL"]
+        self.assertIn("stop-loss", reasons)
+
+    def test_close_only_would_miss(self):
+        # Same series evaluated close-only must NOT stop (proves the test).
+        closes = [100.0] * 60 + [94.0, 95.0, 96.0] + [96.0] * 10
+        k = self._klines(closes)  # default wicks hug the close
+        from glmbot.backtest import Backtester
+
+        results = Backtester(self._cfg(), {"BTCUSDT": k}).run()
+        reasons = [t.reason for t in results["BTCUSDT"].trades if t.side == "SELL"]
+        self.assertNotIn("stop-loss", reasons)
+
+
+class TestFunding(unittest.TestCase):
+    """#19: funding deducted while a futures position is held."""
+
+    def _cfg(self):
+        cfg = make_cfg(strategies=["ema_cross"])
+        cfg.market = "futures"
+        cfg.leverage = 2
+        cfg.risk.take_profit_pct = 1000.0  # never hit: hold to the end
+        cfg.risk.stop_loss_pct = 50.0
+        cfg.risk.trailing_stop_pct = 0.0
+        cfg.risk.breakeven_trigger_pct = 0.0
+        return cfg
+
+    def _klines(self):
+        # V-shape bottoming after bar 60: golden cross fires inside the loop,
+        # then a steady climb holds the long to the end of the series.
+        closes = [130.0 - i * 0.43 for i in range(70)] + [100.0 + i * 0.6 for i in range(130)]
+        return Klines.from_lists(
+            close=closes,
+            high=[c * 1.001 for c in closes],
+            low=[c * 0.999 for c in closes],
+            volume=[100.0] * len(closes),
+        )
+
+    def test_funding_deducted_when_held(self):
+        from glmbot.backtest import Backtester
+
+        k = self._klines()
+        evts = [(t, 0.01) for t in k.open_time]
+        funded = Backtester(self._cfg(), {"BTCUSDT": k}, funding={"BTCUSDT": evts}).run()
+        clean = Backtester(self._cfg(), {"BTCUSDT": k}).run()
+        fr, cr = funded["BTCUSDT"], clean["BTCUSDT"]
+        self.assertGreater(fr.n_trades, 0)
+        self.assertGreater(fr.total_funding, 0.0)
+        self.assertLess(fr.final_equity, cr.final_equity)
+        self.assertEqual(cr.total_funding, 0.0)
+
+
+class TestStopSlippage(unittest.TestCase):
+    """#21: extra adverse slippage applies to stop fills only."""
+
+    def test_stop_slip_worsens_stop_fill(self):
+        from glmbot.backtest import Backtester
+
+        closes = [100.0] * 60 + [94.0, 95.0, 80.0] + [80.0] * 10
+
+        def run(stop_slip):
+            cfg = make_cfg(strategies=["bollinger"])
+            cfg.risk.trailing_stop_pct = 0.0
+            cfg.risk.breakeven_trigger_pct = 0.0
+            cfg.risk.stop_slippage_bps = stop_slip
+            k = Klines.from_lists(
+                close=closes,
+                high=[c * 1.001 for c in closes],
+                low=[c * 0.999 for c in closes],
+                volume=[100.0] * len(closes),
+            )
+            return Backtester(cfg, {"BTCUSDT": k}).run()["BTCUSDT"]
+
+        base = run(0.0)
+        slipped = run(100.0)  # +1% adverse on the stop fill
+        self.assertIn("stop-loss", [t.reason for t in base.trades if t.side == "SELL"])
+        self.assertLess(slipped.final_equity, base.final_equity)
+
+
+class TestFoldsAndSummarize(unittest.TestCase):
+    """#20 walk-forward splits + portfolio roll-up helper."""
+
+    def test_fold_splits_chronological(self):
+        from glmbot.backtest import fold_splits, regime_of
+
+        k = Klines.from_lists(close=[float(1 + i) for i in range(100)])
+        folds = fold_splits(k, 4)
+        self.assertEqual(len(folds), 4)
+        self.assertTrue(all(len(f[1]) == 25 for f in folds))
+        bounds = [(f[1].open_time[0], f[1].open_time[-1]) for f in folds]
+        self.assertTrue(all(b[0] < b[1] for b in bounds))
+        self.assertTrue(all(bounds[i][1] < bounds[i + 1][0] for i in range(3)))
+        self.assertIn("bull", folds[-1][0])  # 76..100 = +31%
+        self.assertEqual(regime_of(0.0), "chop")
+        self.assertEqual(regime_of(-50.0), "bear")
+        self.assertEqual(fold_splits(Klines(), 4), [])
+
+    def test_summarize_run(self):
+        from glmbot.backtest import BTResult, summarize_run
+
+        r = BTResult(
+            symbol="A",
+            start_equity=1000.0,
+            final_equity=1100.0,
+            n_trades=2,
+            n_wins=1,
+            max_drawdown_pct=5.0,
+            total_fees=1.0,
+            total_funding=0.5,
+        )
+        s = summarize_run({"A": r}, 1000.0)
+        self.assertEqual(s["symbols"], 1.0)
+        self.assertEqual(s["trades"], 2.0)
+        self.assertEqual(s["win_rate"], 50.0)
+        self.assertAlmostEqual(s["pnl_pct"], 10.0)
+        self.assertEqual(s["fees"], 1.0)
+        self.assertEqual(s["funding"], 0.5)
+        self.assertEqual(s["final"], 1100.0)
+        self.assertEqual(s["allocated"], 1000.0)
+
+
+class TestRealismConfig(unittest.TestCase):
+    def test_stop_slippage_validated(self):
+        cfg = make_cfg()
+        cfg.risk.stop_slippage_bps = -1.0
+        self.assertTrue(any("stop_slippage" in e for e in cfg.risk.validate()))
 
 
 if __name__ == "__main__":

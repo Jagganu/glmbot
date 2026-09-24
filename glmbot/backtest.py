@@ -7,17 +7,23 @@ Fidelity notes (what matches live, what is simplified):
       delay - fills happen at the *next* bar's close, like a real market order
       placed after the signal bar closes).
     - Entry consensus: ``min_votes`` BUY threshold + SELL veto (same as trader).
-    - Risk exits: SL -> TP -> trailing ratchet (same order as ``RiskManager``).
+    - Risk exits: breakeven -> SL -> TP -> trailing -> time-stop (same order).
     - ATR stops when ``risk.atr_stops`` is enabled.
+  CONSERVATIVE approximations (biased against the trader, never for it)
+    - Intrabar stops (#18): SL tested against the bar LOW, TP against the
+      bar HIGH; if both print in one bar the SL is assumed first.
+    - Stop fills reference ``min(close, stop)`` plus extra stop slippage.
   SIMPLIFIED
     - Fees: taker fee per side (spot 0.10% / futures 0.05%); no maker rebates.
-    - Slippage: optional ``risk.slippage_bps`` added against the trader.
-    - Futures: leverage-scaled notional; no funding payments, no liquidation
-      modeling (stops are assumed to fill - optimistic for wide-stop configs).
+    - Slippage: ``risk.slippage_bps`` on every fill + ``stop_slippage_bps``
+      extra on stop-loss fills (fast-market adverse fill).
+    - Futures funding (#19): deducted from cash at each funding timestamp
+      while a position is open (rate x notional, signed).
+    - No liquidation modeling (stops are assumed to fill).
     - One position per symbol at a time (matches live engine v1).
 
-Metrics per symbol: trades, win rate, PnL%, max drawdown, fees, Sharpe,
-profit factor, expectancy, avg win/loss, exposure %, buy-and-hold delta.
+Metrics per symbol: trades, win rate, PnL%, max drawdown, fees, funding,
+Sharpe, profit factor, expectancy, avg win/loss, exposure %, buy-and-hold.
 """
 
 from __future__ import annotations
@@ -76,6 +82,7 @@ class BTResult:
     sortino: float = 0.0
     exposure_pct: float = 0.0
     buy_hold_pct: float = 0.0
+    total_funding: float = 0.0  # signed net paid (>0 = cost) while in position
     equity_curve: list[float] = field(default_factory=list)
 
     @property
@@ -91,6 +98,7 @@ class BTResult:
             "pnl_pct": round(self.pnl_pct, 2),
             "max_drawdown_pct": round(self.max_drawdown_pct, 2),
             "total_fees": round(self.total_fees, 2),
+            "total_funding": round(self.total_funding, 2),
             "profit_factor": round(self.profit_factor, 2)
             if self.profit_factor != float("inf")
             else None,
@@ -107,7 +115,11 @@ class Backtester:
     """Walk-forward backtester: iterate candles, same rules as live."""
 
     def __init__(
-        self, cfg: BotConfig, klines: dict[str, Klines], starting_equity: float | None = None
+        self,
+        cfg: BotConfig,
+        klines: dict[str, Klines],
+        starting_equity: float | None = None,
+        funding: dict[str, list[tuple[int, float]]] | None = None,
     ):
         self.cfg = cfg
         self.klines = klines
@@ -118,6 +130,12 @@ class Backtester:
         self.leverage = max(1, cfg.leverage) if self.is_futures else 1
         self.fee_rate = FUT_TAKER_FEE if self.is_futures else SPOT_TAKER_FEE
         self.slip = max(0.0, cfg.risk.slippage_bps) / 10_000.0
+        self.stop_slip = max(0.0, cfg.risk.stop_slippage_bps) / 10_000.0
+        self.stop_slip = max(0.0, cfg.risk.stop_slippage_bps) / 10_000.0
+        # funding: symbol -> sorted [(funding_time_ms, rate)] (futures only)
+        self.funding: dict[str, list[tuple[int, float]]] = {}
+        for sym, evts in (funding or {}).items():
+            self.funding[sym] = sorted(evts)
 
     # ---------------- public ----------------
     def run(self) -> dict[str, BTResult]:
@@ -165,6 +183,8 @@ class Backtester:
         trail_high: float | None = None
         equity_curve: list[float] = []
         bars_in_pos = 0
+        funding_evts = sorted(self.funding.get(symbol, []))
+        funding_idx = 0
 
         closes = k.close
         times = k.open_time
@@ -187,7 +207,7 @@ class Backtester:
         pending_entry: dict | None = None  # signal bar -> fill next bar
 
         for i in range(min_rows, n):
-            window = Klines(k.rows(i + 1))
+            window = k.head(i + 1)  # expanding prefix rows 0..i (never rows(): newest)
             close = float(closes[i])
 
             # ---- execute pending entry at this bar's close (+slippage) ----
@@ -257,28 +277,38 @@ class Backtester:
                         )
                 pending_entry = None
 
-            # ---- manage open position exits (at this bar's close) ----
+            # ---- manage open position exits (intrabar-aware, #18) ----
             if qty > 0:
                 bars_in_pos += 1
+                bar_high = float(k.high[i])
+                bar_low = float(k.low[i])
                 exit_reason: str | None = None
+                exit_ref = close
+                extra_slip = 0.0
                 # 0. breakeven lock (mirrors RiskManager.check_exit)
                 be_trig = self.risk_cfg.breakeven_trigger_pct
                 if be_trig > 0 and entry_price > 0 and close >= entry_price * (1 + be_trig / 100):
                     be_sl = entry_price * (1 + self.risk_cfg.breakeven_buffer_pct / 100)
                     if stop_loss is None or be_sl > stop_loss:
                         stop_loss = be_sl
-                if stop_loss is not None and close <= stop_loss:
+                # SL first (pessimistic when both print in one bar), tested on LOW.
+                if stop_loss is not None and bar_low <= stop_loss:
                     exit_reason = "stop-loss"
-                elif take_profit is not None and close >= take_profit:
+                    exit_ref = min(close, stop_loss)
+                    extra_slip = self.stop_slip
+                elif take_profit is not None and bar_high >= take_profit:
                     exit_reason = "take-profit"
+                    exit_ref = max(close, take_profit)
                 elif self.risk_cfg.trailing_stop_pct > 0 and trail_high is not None:
-                    if close > trail_high:
-                        trail_high = close
+                    if bar_high > trail_high:
+                        trail_high = bar_high
                         new_sl = trail_high * (1 - self.risk_cfg.trailing_stop_pct / 100)
                         if stop_loss is None or new_sl > stop_loss:
                             stop_loss = new_sl
-                    if stop_loss is not None and trail_high > entry_price and close <= stop_loss:
+                    trail_sl = trail_high * (1 - self.risk_cfg.trailing_stop_pct / 100)
+                    if stop_loss is not None and trail_high > entry_price and bar_low <= trail_sl:
                         exit_reason = "trailing-stop"
+                        exit_ref = min(close, trail_sl)
                 if (
                     exit_reason is None
                     and self.risk_cfg.max_hold_min > 0
@@ -293,13 +323,33 @@ class Backtester:
                         exit_reason = f"signal exit: {votes[0].reason}"
                 if exit_reason is not None:
                     t = self._sell(
-                        res, symbol, times[i], close, qty, entry_price, margin_locked, exit_reason
+                        res,
+                        symbol,
+                        times[i],
+                        exit_ref,
+                        qty,
+                        entry_price,
+                        margin_locked,
+                        exit_reason,
+                        extra_slip=extra_slip,
                     )
                     cash += t.proceeds
                     qty, margin_locked = 0.0, 0.0
                     entry_time = None
                     stop_loss = take_profit = trail_high = None
                     res.trades.append(t)
+
+            # ---- funding accrual while open (#19, futures only) ----
+            # Local index: each event pays at most once per run, only when a
+            # position held across its timestamp (no shared-state mutation).
+            if self.is_futures and funding_evts:
+                while funding_idx < len(funding_evts) and funding_evts[funding_idx][0] <= times[i]:
+                    ft, rate = funding_evts[funding_idx]
+                    funding_idx += 1
+                    if qty > 0 and entry_time is not None and ft > entry_time:
+                        pay = qty * close * rate
+                        cash -= pay
+                        res.total_funding += pay
 
             # ---- look for entry signal (fills NEXT bar) ----
             if qty == 0 and pending_entry is None:
@@ -342,29 +392,42 @@ class Backtester:
 
     # ---------------- helpers ----------------
     def _warmup_rows(self) -> int:
+        """Warmup over ACTIVE strategies only (defaults for untuned params)."""
         need = 30
         p = self.cfg.strategy_params
-        need = max(need, int(p.get("ema_cross", {}).get("slow", 21)) + 2)
-        need = max(
-            need,
-            int(p.get("macd", {}).get("slow", 26)) + int(p.get("macd", {}).get("signal", 9)) + 2,
-        )
-        need = max(need, int(p.get("bollinger", {}).get("period", 20)) + 2)
-        need = max(need, int(p.get("vwap_trend", {}).get("period", 20)) + 2)
-        need = max(
-            need,
-            int(p.get("stoch_rsi_cross", {}).get("rsi_period", 14))
-            + int(p.get("stoch_rsi_cross", {}).get("stoch_period", 14))
-            + 1,
-        )
-        need = max(
-            need,
-            int(p.get("bollinger_squeeze", {}).get("period", 20))
-            + int(p.get("bollinger_squeeze", {}).get("lookback", 50)),
-        )
-        need = max(need, int(p.get("trend_momentum", {}).get("slow", 50)) + 2)
-        need = max(need, int(p.get("donchian_breakout", {}).get("period", 20)) + 2)
-        need = max(need, int(p.get("supertrend", {}).get("period", 10)) + 3)
+        active = set(self.cfg.strategies)
+        if "ema_cross" in active:
+            need = max(need, int(p.get("ema_cross", {}).get("slow", 21)) + 2)
+        if "macd" in active:
+            need = max(
+                need,
+                int(p.get("macd", {}).get("slow", 26))
+                + int(p.get("macd", {}).get("signal", 9))
+                + 2,
+            )
+        if "bollinger" in active:
+            need = max(need, int(p.get("bollinger", {}).get("period", 20)) + 2)
+        if "vwap_trend" in active:
+            need = max(need, int(p.get("vwap_trend", {}).get("period", 20)) + 2)
+        if "stoch_rsi_cross" in active:
+            need = max(
+                need,
+                int(p.get("stoch_rsi_cross", {}).get("rsi_period", 14))
+                + int(p.get("stoch_rsi_cross", {}).get("stoch_period", 14))
+                + 1,
+            )
+        if "bollinger_squeeze" in active:
+            need = max(
+                need,
+                int(p.get("bollinger_squeeze", {}).get("period", 20))
+                + int(p.get("bollinger_squeeze", {}).get("lookback", 50)),
+            )
+        if "trend_momentum" in active:
+            need = max(need, int(p.get("trend_momentum", {}).get("slow", 50)) + 2)
+        if "donchian_breakout" in active:
+            need = max(need, int(p.get("donchian_breakout", {}).get("period", 20)) + 2)
+        if "supertrend" in active:
+            need = max(need, int(p.get("supertrend", {}).get("period", 10)) + 3)
         if self.risk_cfg.atr_stops:
             need = max(need, self.risk_cfg.atr_period + 2)
         return need
@@ -399,8 +462,9 @@ class Backtester:
         entry_price: float,
         margin_locked: float,
         reason: str,
+        extra_slip: float = 0.0,
     ) -> BTTrade:
-        fill_price = price * (1 - self.slip)
+        fill_price = price * (1 - self.slip) * (1 - extra_slip)
         gross = qty * fill_price
         fee = gross * self.fee_rate
         res.total_fees += fee
@@ -471,3 +535,63 @@ class Backtester:
             res.sharpe = sharpe_ratio(res.equity_curve)
             res.sortino = sortino_ratio(res.equity_curve)
         res.exposure_pct = (bars_in_pos / total_bars * 100) if total_bars > 0 else 0.0
+
+
+def _day(ms: int) -> str:
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def regime_of(buy_hold_pct: float) -> str:
+    """Crude regime label from the fold's buy-and-hold return."""
+    if buy_hold_pct > 10:
+        return "bull"
+    if buy_hold_pct < -10:
+        return "bear"
+    return "chop"
+
+
+def fold_splits(klines: Klines, n: int) -> list[tuple[str, Klines]]:
+    """Split klines into ``n`` chronological contiguous folds (#20).
+
+    Labels carry date range + regime so walk-forward tables read as
+    bull/bear/chop evidence instead of anonymous folds.
+    """
+    n = max(1, int(n))
+    total = len(klines)
+    if total == 0:
+        return []
+    size = max(1, total // n)
+    out: list[tuple[str, Klines]] = []
+    for i in range(n):
+        a = i * size
+        b = total if i == n - 1 else min(total, (i + 1) * size)
+        if b - a < 2:
+            continue
+        rows = [klines[j] for j in range(a, b)]
+        sub = Klines(rows)
+        first, last = sub.close[0], sub.close[-1]
+        bh = (last / first - 1) * 100 if first else 0.0
+        label = f"fold {i + 1}/{n} {_day(rows[0]['open_time'])}..{_day(rows[-1]['open_time'])}"
+        out.append((f"{label} ({regime_of(bh)})", sub))
+    return out
+
+
+def summarize_run(results: dict[str, BTResult], starting: float) -> dict[str, float]:
+    """Portfolio roll-up over independent per-symbol runs (shared with reports)."""
+    total_final = sum(r.final_equity for r in results.values())
+    base = starting * max(len(results), 1)
+    all_trades = sum(r.n_trades for r in results.values())
+    all_wins = sum(r.n_wins for r in results.values())
+    return {
+        "symbols": float(len(results)),
+        "trades": float(all_trades),
+        "win_rate": (all_wins / all_trades * 100) if all_trades else 0.0,
+        "pnl_pct": (total_final / base - 1) * 100 if base else 0.0,
+        "worst_max_dd": max((r.max_drawdown_pct for r in results.values()), default=0.0),
+        "fees": sum(r.total_fees for r in results.values()),
+        "funding": sum(r.total_funding for r in results.values()),
+        "final": total_final,
+        "allocated": base,
+    }

@@ -74,6 +74,18 @@ class Klines:
         k.n = self.n - 1
         return k
 
+    def head(self, count: int) -> Klines:
+        """First ``count`` rows (oldest..newest): the expanding window prefix.
+
+        Walk-forward engines must use this (rows ``0..i``). ``rows()``
+        returns the *newest* bars and would leak the future into signals.
+        """
+        out = Klines()
+        for f in ("open_time", "open", "high", "low", "close", "volume"):
+            setattr(out, f, list(getattr(self, f))[: max(0, count)])
+        out.n = len(out.close)
+        return out
+
     def drop_duplicates_by_time(self) -> Klines:
         """Deduplicate on open_time, keeping the NEWEST row on conflicts."""
         seen = set()

@@ -1,6 +1,23 @@
 # Changelog — glmbot
 # Follows Keep a Changelog (https://keepachangelog.com). Versions are SemVer.
 
+## [1.5.0] — 2026-09-24
+### Added (Tier 2: trustworthy backtests)
+- Intrabar stops (#18): SL on bar LOW, TP on bar HIGH, SL-first on double
+  print, stop fills at min(close, stop) + extra stop slippage. Fixed a real
+  look-ahead bug found along the way: the engine evaluated signals on the
+  newest bars (`rows()`) instead of the expanding prefix (`head()`); warmup
+  now counts active strategies only.
+- Funding fees (#19): historical funding rates fetched and deducted while
+  futures positions are held; reported per symbol.
+- Stop slippage (#21): `risk.stop_slippage_bps` (default 0) models worse
+  fills on stop exits.
+- Walk-forward folds (#20): `--folds N` splits history chronologically with
+  bull/bear/chop labels and a profitable-folds consistency score.
+- Ablation (#17): `--ablate` runs full vs minus-one vs single sets with
+  keep/drop verdicts per strategy.
+- 9 new tests (84 total).
+
 ## [1.4.0] — 2026-09-24
 ### Added (Tier 1: survival, honest testing, risk control)
 - Trailing-sync: ratcheted journal SL is pushed to the exchange stop

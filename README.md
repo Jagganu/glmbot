@@ -209,22 +209,33 @@ config: `bot.py validate --json`. Secrets are never printed (masked repr).
   ratchets, reconciliation. Stops do not need the loop; the loop needs the
   stops (as backstop). Keep `exchange_stops: true`.
 
-## Backtesting
+## Backtesting (trustworthy by design — Tier 2)
 
 ```bash
 python bot.py backtest -d 30 --csv backtest.csv
+python bot.py backtest -d 30 --folds 4        # walk-forward across regimes
+python bot.py backtest -d 14 --ablate         # keep only strategies with edge
 ```
 
 - Real 15m klines paginated from the data market (same source as live).
 - Signals evaluated per closed bar; fills at the **next** bar's close.
+- **Intrabar stops**: SL tested against bar LOW, TP against bar HIGH; both
+  printing in one bar assumes SL first (pessimistic). Stops fill at
+  `min(close, stop)` + extra `stop_slippage_bps`.
+- **Funding deducted** (futures): historical rates applied while holding.
+- **Walk-forward** (`--folds N`): chronological folds labelled bull/bear/chop
+  by buy-and-hold, with a profitable-folds consistency score.
+- **Ablation** (`--ablate`): full set vs minus-one vs single runs with
+  keep/drop verdicts per strategy.
 - Metrics: trades, win rate, PnL%, MaxDD, profit factor, expectancy,
   avg win/loss, Sharpe/Sortino (15m-annualized), exposure%, buy-and-hold
-  delta, fees. Portfolio panel rolls up independent per-symbol runs.
+  delta, fees, funding. Portfolio panel rolls up independent per-symbol runs.
 - `--csv` writes summary + `.trades.csv` (per-fill audit trail).
 
-Limitations (be honest with yourself): no funding payments, no liquidation
-modeling, stops assumed to fill, no order-book depth. Backtests ≠ future
-results — they validate *logic*, not profitability.
+Limitations (be honest with yourself): no liquidation modeling, no
+order-book depth, funding uses mark notional at bar close. Backtests ≠
+future results — they validate *logic*, not profitability. Demand green
+folds across regimes before risking capital.
 
 ## Operations runbook
 
@@ -271,7 +282,7 @@ optimization for Termux. `data/glm.db` is portable PC ↔ phone.
 
 ```bash
 pip install -r requirements-dev.txt
-python tests.py          # 74 unit tests, no network
+python tests.py          # 84 unit tests, no network
 make lint | make typecheck
 ```
 
