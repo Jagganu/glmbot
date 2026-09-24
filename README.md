@@ -187,6 +187,21 @@ prove the system on paper/testnet, size small live.
 Full documented template: `config.example.yml`. Machine-readable current
 config: `bot.py validate --json`. Secrets are never printed (masked repr).
 
+## Latency model (read before asking for "faster stops")
+
+- **Stop/TP reaction is exchange-side, single-digit ms.** Every live futures
+  entry attaches `STOP_MARKET` + `TAKE_PROFIT_MARKET` (`closePosition`,
+  `MARK_PRICE` trigger). Binance's matching engine evaluates the trigger and
+  fills at market with zero network hops — no bot loop involved. Verify with
+  `status` (`(EX)` marker) or the `openAlgoOrders` endpoint.
+- **Bot-side reaction cannot beat physics.** Measured RTT from a home
+  connection is ~160–350 ms per request; detect-then-order needs two trips,
+  so ~350–700 ms is the floor. Sub-200 ms bot-loop reaction requires
+  colocation next to the matching engine — no code change fixes distance.
+- **What the 60 s loop is for:** entries, signal exits, trailing/breakeven
+  ratchets, reconciliation. Stops do not need the loop; the loop needs the
+  stops (as backstop). Keep `exchange_stops: true`.
+
 ## Backtesting
 
 ```bash
