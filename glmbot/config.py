@@ -97,6 +97,15 @@ class RiskCfg:
     max_drawdown_halt_pct: float = 10.0  # 0 = disabled; else halt day after N% peak DD
     risk_per_trade_pct: float = 1.0  # 0 = legacy; else risk N% equity, capped by budget
     stop_slippage_bps: float = 0.0  # extra adverse slippage on stop fills (backtest)
+    # --- v2 advanced guards (all opt-in, 0/False = disabled -> backward compatible) ---
+    daily_profit_lock_pct: float = 0.0  # halt entries after +N% day (lock in wins)
+    chandelier_enabled: bool = False  # ATR chandelier exit (highest high - mult*ATR)
+    chandelier_period: int = 22
+    chandelier_mult: float = 3.0
+    max_atr_pct: float = 0.0  # skip entries when ATR/price*100 > cap (explosive vol)
+    min_atr_pct: float = 0.0  # skip entries when ATR/price*100 < floor (dead market)
+    volume_filter_mult: float = 0.0  # require last vol >= SMA20 * mult (0 = off)
+    cooldown_after_loss_min: int = 0  # extra global cooldown after a losing close
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> RiskCfg:
@@ -125,6 +134,14 @@ class RiskCfg:
                 max_drawdown_halt_pct=float(d.get("max_drawdown_halt_pct", 10.0)),
                 risk_per_trade_pct=float(d.get("risk_per_trade_pct", 1.0)),
                 stop_slippage_bps=float(d.get("stop_slippage_bps", 0.0)),
+                daily_profit_lock_pct=float(d.get("daily_profit_lock_pct", 0.0)),
+                chandelier_enabled=bool(d.get("chandelier_enabled", False)),
+                chandelier_period=int(d.get("chandelier_period", 22)),
+                chandelier_mult=float(d.get("chandelier_mult", 3.0)),
+                max_atr_pct=float(d.get("max_atr_pct", 0.0)),
+                min_atr_pct=float(d.get("min_atr_pct", 0.0)),
+                volume_filter_mult=float(d.get("volume_filter_mult", 0.0)),
+                cooldown_after_loss_min=int(d.get("cooldown_after_loss_min", 0)),
             )
         except KeyError as e:
             raise ConfigError(f"risk section missing required key: {e}") from e
@@ -171,6 +188,22 @@ class RiskCfg:
             errs.append("risk.risk_per_trade_pct must be in [0, 100] (0 disables)")
         if self.stop_slippage_bps < 0:
             errs.append("risk.stop_slippage_bps must be >= 0")
+        if self.daily_profit_lock_pct < 0:
+            errs.append("risk.daily_profit_lock_pct must be >= 0 (0 disables)")
+        if self.chandelier_period < 2:
+            errs.append("risk.chandelier_period must be >= 2")
+        if self.chandelier_mult <= 0:
+            errs.append("risk.chandelier_mult must be > 0")
+        if self.max_atr_pct < 0:
+            errs.append("risk.max_atr_pct must be >= 0 (0 disables)")
+        if self.min_atr_pct < 0:
+            errs.append("risk.min_atr_pct must be >= 0 (0 disables)")
+        if self.max_atr_pct > 0 and self.min_atr_pct > 0 and self.min_atr_pct > self.max_atr_pct:
+            errs.append("risk.min_atr_pct must be <= risk.max_atr_pct")
+        if self.volume_filter_mult < 0:
+            errs.append("risk.volume_filter_mult must be >= 0 (0 disables)")
+        if self.cooldown_after_loss_min < 0:
+            errs.append("risk.cooldown_after_loss_min must be >= 0 (0 disables)")
         return errs
 
 
@@ -203,6 +236,10 @@ class BotConfig:
     # Exchange-native STOP_MARKET + TAKE_PROFIT_MARKET on every live futures
     # entry (safety net that fires even while the bot is down). Default on.
     exchange_stops: bool = True
+    # Regime filter (opt-in, default off): skip longs in bear/chop/volatile
+    # regimes as classified by glmbot.regime.detect_regime on closed candles.
+    regime_filter: bool = False
+    regime_allow_chop: bool = False
 
     @property
     def base_url(self) -> str:
@@ -276,6 +313,8 @@ class BotConfig:
             "base_url": self.base_url,
             "api_key_set": bool(self.api_key and not self.api_key.startswith("YOUR_")),
             "exchange_stops": self.exchange_stops,
+            "regime_filter": self.regime_filter,
+            "regime_allow_chop": self.regime_allow_chop,
             "risk": {
                 "quote_budget": self.risk.quote_budget,
                 "per_trade_pct": self.risk.per_trade_pct,
@@ -292,6 +331,14 @@ class BotConfig:
                 "consecutive_loss_halt": self.risk.consecutive_loss_halt,
                 "max_drawdown_halt_pct": self.risk.max_drawdown_halt_pct,
                 "risk_per_trade_pct": self.risk.risk_per_trade_pct,
+                "daily_profit_lock_pct": self.risk.daily_profit_lock_pct,
+                "chandelier_enabled": self.risk.chandelier_enabled,
+                "chandelier_period": self.risk.chandelier_period,
+                "chandelier_mult": self.risk.chandelier_mult,
+                "max_atr_pct": self.risk.max_atr_pct,
+                "min_atr_pct": self.risk.min_atr_pct,
+                "volume_filter_mult": self.risk.volume_filter_mult,
+                "cooldown_after_loss_min": self.risk.cooldown_after_loss_min,
             },
             "config_path": self.config_path,
         }
@@ -359,6 +406,8 @@ def load_config(path: str | None = None) -> BotConfig:
             webhook=raw.get("notifier", {}).get("webhook", {}) or {},
             config_path=str(p),
             exchange_stops=bool(trading.get("exchange_stops", True)),
+            regime_filter=bool(trading.get("regime_filter", False)),
+            regime_allow_chop=bool(trading.get("regime_allow_chop", False)),
         )
     except (TypeError, ValueError) as e:
         raise ConfigError(f"config has invalid value types: {e}") from e

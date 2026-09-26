@@ -12,8 +12,9 @@ Conventions
 
 Built-ins: ema_cross, rsi_reversion, macd, bollinger, supertrend,
 donchian_breakout, vwap_trend, stoch_rsi_cross, bollinger_squeeze,
-trend_momentum. Add new ones by subclassing :class:`Strategy` and
-registering in :data:`REGISTRY`.
+trend_momentum, adx_trend, ichimoku_trend, keltner_breakout, obv_trend,
+mfi_reversion, tema_trend, stoch_cross, cci_reversion. Add new ones by
+subclassing :class:`Strategy` and registering in :data:`REGISTRY`.
 """
 
 from __future__ import annotations
@@ -22,7 +23,24 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from .indicators import bollinger, donchian, ema, macd, rsi, stoch_rsi, supertrend, vwap
+from .indicators import (
+    adx,
+    bollinger,
+    cci,
+    donchian,
+    ema,
+    ichimoku,
+    keltner,
+    macd,
+    mfi,
+    obv,
+    rsi,
+    stoch_osc,
+    stoch_rsi,
+    supertrend,
+    tema,
+    vwap,
+)
 from .klines import Klines
 
 log = logging.getLogger("glmbot.strategy")
@@ -494,6 +512,329 @@ class TrendMomentum(Strategy):
         return Signal(HOLD, f"{regime}, RSI {r[-1]:.1f}", symbol, price, self.name)
 
 
+class ADXTrend(Strategy):
+    """Trend strength + direction: +DI cross above -DI with ADX confirmation."""
+
+    name = "adx_trend"
+    meta = StrategyMeta(
+        "adx_trend",
+        "BUY on +DI cross above -DI with ADX above threshold; SELL on opposite cross.",
+        {"period": "14 (ADX/DI period)", "adx_min": "20.0 (trend strength floor)"},
+    )
+
+    def __init__(self, params=None):
+        super().__init__(params)
+        self.period = int(self.params.get("period", 14))
+        self.adx_min = float(self.params.get("adx_min", 20.0))
+
+    def validate_params(self) -> None:
+        if int(self.params.get("period", 14)) < 2:
+            raise ValueError("adx_trend: period must be >= 2")
+        if not 0 <= float(self.params.get("adx_min", 20.0)) <= 100:
+            raise ValueError("adx_trend: adx_min must be 0..100")
+
+    def evaluate(self, symbol: str, k: Klines) -> Signal:
+        price = float(k.close[-1]) if k.close else 0.0
+        if len(k) < 2 * self.period + 2:
+            return Signal(HOLD, "insufficient history", symbol, price, self.name)
+        a, pdi, mdi = adx(k.high, k.low, k.close, self.period)
+        if a[-1] is None or pdi[-2] is None or mdi[-2] is None or pdi[-1] is None or mdi[-1] is None:
+            return Signal(HOLD, "adx warmup", symbol, price, self.name)
+        prev_diff = pdi[-2] - mdi[-2]  # type: ignore[operator]
+        curr_diff = pdi[-1] - mdi[-1]  # type: ignore[operator]
+        strength = float(a[-1])
+        if prev_diff <= 0 < curr_diff and strength >= self.adx_min:
+            return Signal(BUY, f"+DI crossed above -DI (ADX {strength:.1f})", symbol, price, self.name)
+        if prev_diff >= 0 > curr_diff:
+            return Signal(SELL, f"-DI crossed above +DI (ADX {strength:.1f})", symbol, price, self.name)
+        return Signal(HOLD, f"ADX {strength:.1f}", symbol, price, self.name)
+
+
+class IchimokuTrend(Strategy):
+    """Ichimoku regime: price vs cloud + Tenkan/Kijun cross (no forward shift)."""
+
+    name = "ichimoku_trend"
+    meta = StrategyMeta(
+        "ichimoku_trend",
+        "BUY: TK cross up + price above cloud; SELL: TK cross down or price below cloud.",
+        {"tenkan": "9", "kijun": "26", "senkou_b": "52 (cloud lookback)"},
+    )
+
+    def __init__(self, params=None):
+        super().__init__(params)
+        self.tenkan = int(self.params.get("tenkan", 9))
+        self.kijun = int(self.params.get("kijun", 26))
+        self.senkou_b = int(self.params.get("senkou_b", 52))
+
+    def validate_params(self) -> None:
+        t, kj = int(self.params.get("tenkan", 9)), int(self.params.get("kijun", 26))
+        sb = int(self.params.get("senkou_b", 52))
+        if t < 2 or kj < 2 or sb < 2:
+            raise ValueError("ichimoku_trend: periods must be >= 2")
+        if t >= kj:
+            raise ValueError("ichimoku_trend: tenkan must be < kijun")
+
+    def evaluate(self, symbol: str, k: Klines) -> Signal:
+        price = float(k.close[-1]) if k.close else 0.0
+        if len(k) < self.senkou_b + 2:
+            return Signal(HOLD, "insufficient history", symbol, price, self.name)
+        t, kj, sa, sb = ichimoku(k.high, k.low, k.close, self.tenkan, self.kijun, self.senkou_b)
+        if t[-2] is None or kj[-2] is None or t[-1] is None or kj[-1] is None:
+            return Signal(HOLD, "ichimoku warmup", symbol, price, self.name)
+        if sa[-1] is None or sb[-1] is None:
+            return Signal(HOLD, "cloud warmup", symbol, price, self.name)
+        cloud_top = max(float(sa[-1]), float(sb[-1]))
+        cloud_bot = min(float(sa[-1]), float(sb[-1]))
+        cross_up = (t[-2] - kj[-2]) <= 0 < (t[-1] - kj[-1])  # type: ignore[operator]
+        cross_dn = (t[-2] - kj[-2]) >= 0 > (t[-1] - kj[-1])  # type: ignore[operator]
+        if cross_up and price > cloud_top:
+            return Signal(BUY, "TK cross up above cloud", symbol, price, self.name)
+        if cross_dn or price < cloud_bot:
+            reason = "TK cross down" if cross_dn else f"price below cloud ({cloud_bot:.6g})"
+            return Signal(SELL, reason, symbol, price, self.name)
+        above = price > cloud_top
+        return Signal(HOLD, f"price {'above' if above else 'inside/below'} cloud", symbol, price, self.name)
+
+
+class KeltnerBreakout(Strategy):
+    """Volatility breakout: close cross outside Keltner channels (EMA +/- ATR)."""
+
+    name = "keltner_breakout"
+    meta = StrategyMeta(
+        "keltner_breakout",
+        "BUY on close cross above upper band; SELL on cross below lower band.",
+        {"ema_period": "20", "atr_period": "10", "multiplier": "2.0 (channel width)"},
+    )
+
+    def __init__(self, params=None):
+        super().__init__(params)
+        self.ema_period = int(self.params.get("ema_period", 20))
+        self.atr_period = int(self.params.get("atr_period", 10))
+        self.mult = float(self.params.get("multiplier", 2.0))
+
+    def validate_params(self) -> None:
+        if int(self.params.get("ema_period", 20)) < 2:
+            raise ValueError("keltner_breakout: ema_period must be >= 2")
+        if int(self.params.get("atr_period", 10)) < 2:
+            raise ValueError("keltner_breakout: atr_period must be >= 2")
+        if float(self.params.get("multiplier", 2.0)) <= 0:
+            raise ValueError("keltner_breakout: multiplier must be > 0")
+
+    def evaluate(self, symbol: str, k: Klines) -> Signal:
+        price = float(k.close[-1]) if k.close else 0.0
+        if len(k) < max(self.ema_period, self.atr_period) + 3:
+            return Signal(HOLD, "insufficient history", symbol, price, self.name)
+        upper, _mid, lower = keltner(k.high, k.low, k.close, self.ema_period, self.atr_period, self.mult)
+        if upper[-2] is None or lower[-2] is None or upper[-1] is None or lower[-1] is None:
+            return Signal(HOLD, "keltner warmup", symbol, price, self.name)
+        prev_c = float(k.close[-2])
+        if prev_c <= float(upper[-2]) and price > float(upper[-1]):
+            return Signal(BUY, f"breakout above Keltner {upper[-1]:.6g}", symbol, price, self.name)
+        if prev_c >= float(lower[-2]) and price < float(lower[-1]):
+            return Signal(SELL, f"breakdown below Keltner {lower[-1]:.6g}", symbol, price, self.name)
+        return Signal(HOLD, "inside Keltner channel", symbol, price, self.name)
+
+
+class OBVTrend(Strategy):
+    """Smart-money flow: BUY on OBV fast-EMA cross above slow-EMA; SELL below."""
+
+    name = "obv_trend"
+    meta = StrategyMeta(
+        "obv_trend",
+        "BUY on OBV fast-EMA cross above slow-EMA; SELL on cross below.",
+        {"fast": "9 (OBV fast EMA)", "slow": "21 (OBV slow EMA)"},
+    )
+
+    def __init__(self, params=None):
+        super().__init__(params)
+        self.fast = int(self.params.get("fast", 9))
+        self.slow = int(self.params.get("slow", 21))
+
+    def validate_params(self) -> None:
+        fast = int(self.params.get("fast", 9))
+        slow = int(self.params.get("slow", 21))
+        if fast < 2 or slow < 3:
+            raise ValueError("obv_trend: periods must be >= 2/3")
+        if fast >= slow:
+            raise ValueError("obv_trend: fast must be < slow")
+
+    def evaluate(self, symbol: str, k: Klines) -> Signal:
+        price = float(k.close[-1]) if k.close else 0.0
+        if len(k) < self.slow + 2:
+            return Signal(HOLD, "insufficient history", symbol, price, self.name)
+        flow = obv(k.close, k.volume)
+        f = ema(flow, self.fast)
+        s = ema(flow, self.slow)
+        if f[-2] is None or s[-2] is None or f[-1] is None or s[-1] is None:
+            return Signal(HOLD, "obv warmup", symbol, price, self.name)
+        prev_diff = f[-2] - s[-2]  # type: ignore[operator]
+        curr_diff = f[-1] - s[-1]  # type: ignore[operator]
+        if prev_diff <= 0 < curr_diff:
+            return Signal(BUY, "OBV accumulation cross up", symbol, price, self.name)
+        if prev_diff >= 0 > curr_diff:
+            return Signal(SELL, "OBV distribution cross down", symbol, price, self.name)
+        return Signal(HOLD, "no OBV cross", symbol, price, self.name)
+
+
+class MFIReversion(Strategy):
+    """Volume-weighted mean reversion: MFI recovery above oversold = BUY."""
+
+    name = "mfi_reversion"
+    meta = StrategyMeta(
+        "mfi_reversion",
+        "BUY on MFI recovery above oversold; SELL on drop below overbought.",
+        {"period": "14", "oversold": "20", "overbought": "80"},
+    )
+
+    def __init__(self, params=None):
+        super().__init__(params)
+        self.period = int(self.params.get("period", 14))
+        self.os = float(self.params.get("oversold", 20))
+        self.ob = float(self.params.get("overbought", 80))
+
+    def validate_params(self) -> None:
+        if int(self.params.get("period", 14)) < 2:
+            raise ValueError("mfi_reversion: period must be >= 2")
+        os_ = float(self.params.get("oversold", 20))
+        ob = float(self.params.get("overbought", 80))
+        if not 0 < os_ < ob < 100:
+            raise ValueError("mfi_reversion: need 0 < oversold < overbought < 100")
+
+    def evaluate(self, symbol: str, k: Klines) -> Signal:
+        price = float(k.close[-1]) if k.close else 0.0
+        if len(k) < self.period + 2:
+            return Signal(HOLD, "insufficient history", symbol, price, self.name)
+        m = mfi(k.high, k.low, k.close, k.volume, self.period)
+        prev, cur = m[-2], m[-1]
+        if prev is None or cur is None:
+            return Signal(HOLD, "mfi warmup", symbol, price, self.name)
+        if prev <= self.os < cur:
+            return Signal(BUY, f"MFI recovered above {self.os:g} ({cur:.1f})", symbol, price, self.name)
+        if prev >= self.ob > cur:
+            return Signal(SELL, f"MFI dropped below {self.ob:g} ({cur:.1f})", symbol, price, self.name)
+        return Signal(HOLD, f"MFI {cur:.1f}", symbol, price, self.name)
+
+
+class TEMATrend(Strategy):
+    """Low-lag trend: fast TEMA cross above slow TEMA = BUY (faster than EMA)."""
+
+    name = "tema_trend"
+    meta = StrategyMeta(
+        "tema_trend",
+        "BUY on fast-TEMA cross above slow-TEMA; SELL on cross below.",
+        {"fast": "9 (fast TEMA)", "slow": "21 (slow TEMA)"},
+    )
+
+    def __init__(self, params=None):
+        super().__init__(params)
+        self.fast = int(self.params.get("fast", 9))
+        self.slow = int(self.params.get("slow", 21))
+
+    def validate_params(self) -> None:
+        fast = int(self.params.get("fast", 9))
+        slow = int(self.params.get("slow", 21))
+        if fast < 2 or slow < 3:
+            raise ValueError("tema_trend: periods must be >= 2/3")
+        if fast >= slow:
+            raise ValueError("tema_trend: fast must be < slow")
+
+    def evaluate(self, symbol: str, k: Klines) -> Signal:
+        price = float(k.close[-1]) if k.close else 0.0
+        if len(k) < self.slow * 3 + 2:
+            return Signal(HOLD, "insufficient history", symbol, price, self.name)
+        f = tema(k.close, self.fast)
+        s = tema(k.close, self.slow)
+        if f[-2] is None or s[-2] is None or f[-1] is None or s[-1] is None:
+            return Signal(HOLD, "tema warmup", symbol, price, self.name)
+        prev_diff = f[-2] - s[-2]  # type: ignore[operator]
+        curr_diff = f[-1] - s[-1]  # type: ignore[operator]
+        if prev_diff <= 0 < curr_diff:
+            return Signal(BUY, f"TEMA{self.fast} crossed above TEMA{self.slow}", symbol, price, self.name)
+        if prev_diff >= 0 > curr_diff:
+            return Signal(SELL, f"TEMA{self.fast} crossed below TEMA{self.slow}", symbol, price, self.name)
+        return Signal(HOLD, "no TEMA cross", symbol, price, self.name)
+
+
+class StochCross(Strategy):
+    """Classic stochastic ignition: %K cross %D inside extreme zones."""
+
+    name = "stoch_cross"
+    meta = StrategyMeta(
+        "stoch_cross",
+        "BUY on %K cross above %D while oversold; SELL on cross below while overbought.",
+        {"k_period": "14", "d_period": "3", "oversold": "20", "overbought": "80"},
+    )
+
+    def __init__(self, params=None):
+        super().__init__(params)
+        self.kp = int(self.params.get("k_period", 14))
+        self.dp = int(self.params.get("d_period", 3))
+        self.os = float(self.params.get("oversold", 20))
+        self.ob = float(self.params.get("overbought", 80))
+
+    def validate_params(self) -> None:
+        if int(self.params.get("k_period", 14)) < 2:
+            raise ValueError("stoch_cross: k_period must be >= 2")
+        if int(self.params.get("d_period", 3)) < 1:
+            raise ValueError("stoch_cross: d_period must be >= 1")
+        os_ = float(self.params.get("oversold", 20))
+        ob = float(self.params.get("overbought", 80))
+        if not 0 <= os_ < ob <= 100:
+            raise ValueError("stoch_cross: need 0 <= oversold < overbought <= 100")
+
+    def evaluate(self, symbol: str, k: Klines) -> Signal:
+        price = float(k.close[-1]) if k.close else 0.0
+        if len(k) < self.kp + self.dp + 1:
+            return Signal(HOLD, "insufficient history", symbol, price, self.name)
+        kk, dd = stoch_osc(k.high, k.low, k.close, self.kp, self.dp)
+        if kk[-2] is None or dd[-2] is None or kk[-1] is None or dd[-1] is None:
+            return Signal(HOLD, "stoch warmup", symbol, price, self.name)
+        prev_diff = kk[-2] - dd[-2]  # type: ignore[operator]
+        curr_diff = kk[-1] - dd[-1]  # type: ignore[operator]
+        if prev_diff <= 0 < curr_diff and kk[-1] <= self.os + 15:  # type: ignore[operator]
+            return Signal(BUY, f"%K crossed above %D ({kk[-1]:.1f})", symbol, price, self.name)
+        if prev_diff >= 0 > curr_diff and kk[-1] >= self.ob - 15:  # type: ignore[operator]
+            return Signal(SELL, f"%K crossed below %D ({kk[-1]:.1f})", symbol, price, self.name)
+        return Signal(HOLD, f"Stoch {kk[-1]:.1f}/{dd[-1]:.1f}", symbol, price, self.name)
+
+
+class CCIReversion(Strategy):
+    """CCI extremes: snap-back from +/-100 triggers mean-reversion entries."""
+
+    name = "cci_reversion"
+    meta = StrategyMeta(
+        "cci_reversion",
+        "BUY on CCI cross above oversold; SELL on cross below overbought.",
+        {"period": "20", "oversold": "-100", "overbought": "100"},
+    )
+
+    def __init__(self, params=None):
+        super().__init__(params)
+        self.period = int(self.params.get("period", 20))
+        self.os = float(self.params.get("oversold", -100))
+        self.ob = float(self.params.get("overbought", 100))
+
+    def validate_params(self) -> None:
+        if int(self.params.get("period", 20)) < 2:
+            raise ValueError("cci_reversion: period must be >= 2")
+        if not float(self.params.get("oversold", -100)) < float(self.params.get("overbought", 100)):
+            raise ValueError("cci_reversion: need oversold < overbought")
+
+    def evaluate(self, symbol: str, k: Klines) -> Signal:
+        price = float(k.close[-1]) if k.close else 0.0
+        if len(k) < self.period + 2:
+            return Signal(HOLD, "insufficient history", symbol, price, self.name)
+        c = cci(k.high, k.low, k.close, self.period)
+        prev, cur = c[-2], c[-1]
+        if prev is None or cur is None:
+            return Signal(HOLD, "cci warmup", symbol, price, self.name)
+        if prev <= self.os < cur:
+            return Signal(BUY, f"CCI recovered above {self.os:g} ({cur:.1f})", symbol, price, self.name)
+        if prev >= self.ob > cur:
+            return Signal(SELL, f"CCI dropped below {self.ob:g} ({cur:.1f})", symbol, price, self.name)
+        return Signal(HOLD, f"CCI {cur:.1f}", symbol, price, self.name)
+
+
 REGISTRY: dict[str, type] = {
     EMACross.name: EMACross,
     RSIReversion.name: RSIReversion,
@@ -505,6 +846,14 @@ REGISTRY: dict[str, type] = {
     StochRSICross.name: StochRSICross,
     BollingerSqueeze.name: BollingerSqueeze,
     TrendMomentum.name: TrendMomentum,
+    ADXTrend.name: ADXTrend,
+    IchimokuTrend.name: IchimokuTrend,
+    KeltnerBreakout.name: KeltnerBreakout,
+    OBVTrend.name: OBVTrend,
+    MFIReversion.name: MFIReversion,
+    TEMATrend.name: TEMATrend,
+    StochCross.name: StochCross,
+    CCIReversion.name: CCIReversion,
 }
 
 STRATEGY_CATALOG: list[StrategyMeta] = [cls.meta for cls in REGISTRY.values()]

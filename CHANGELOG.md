@@ -1,6 +1,46 @@
 # Changelog — glmbot
 # Follows Keep a Changelog (https://keepachangelog.com). Versions are SemVer.
 
+## [2.1.1] — 2026-09-25
+### Fixed
+- Journal schema bug: table-level `UNIQUE(symbol, mode, status)` blocked the
+  2nd-ever close of a symbol (`IntegrityError`, ghost positions could never
+  reconcile). Replaced with a partial unique index on open rows only; existing
+  journals auto-migrate on startup with data preserved. Found live on BNBUSDT.
+
+## [2.1.0] — 2026-09-25
+### Added
+- `bot.py set-env demo|real`: one-command switch between Binance demo
+  (testnet) and real (mainnet) API. Paper mode stays available but unused
+  when `trading.mode` is `live`.
+
+## [2.0.0] — 2026-09-25
+### Added (advanced tier: 18 strategies, regime engine, optimizer, pro risk)
+- 12 new indicators (pure Python): `wma`, `tema`, `roc`, `cci`, `willr`,
+  `obv`, `mfi`, `keltner`, `psar`, `stoch_osc`, `adx`, `ichimoku`.
+- 8 new strategies (18 total): `adx_trend`, `ichimoku_trend`,
+  `keltner_breakout`, `obv_trend`, `mfi_reversion`, `tema_trend`,
+  `stoch_cross`, `cci_reversion`. All backward compatible (opt-in via config).
+- Regime engine (`glmbot/regime.py`): bull/bear/chop/volatile from EMA + ADX
+  + ATR%; optional live entry filter (`trading.regime_filter`,
+  `regime_allow_chop`) + `bot.py regime` CLI.
+- Grid optimizer (`glmbot/optimize.py` + `bot.py optimize -d 14 --set
+  strat.param=v1,v2 --metric sharpe|pnl|calmar`): cartesian search over the
+  faithful backtester, ranked best-first, capped at 64 combos.
+- Pro risk guards (all opt-in, defaults off): daily profit lock,
+  chandelier ATR exit (live + backtest mirrored), volatility regime filter
+  (`max/min_atr_pct`), volume participation filter, post-loss global cooldown.
+- Pro metrics: Calmar, ulcer index, VaR-95/CVaR-95, recovery factor
+  (backtest table + CSV + `--json`).
+- 5 new CLI commands: `optimize`, `screener` (ranked momentum + regime +
+  volume scan), `regime`, `funding` (futures 7d funding stats), `analyze`
+  (journal PnL by symbol + strategy, win rate, profit factor).
+- Backtest fidelity: chandelier + volatility/volume entry filters mirrored
+  live-identically; ATR series precomputed whenever any ATR consumer is on;
+  warmup covers all 18 strategies.
+- All 84 existing tests still pass unmodified (public APIs preserved via
+  optional args + default-off flags).
+
 ## [1.5.0] — 2026-09-24
 ### Added (Tier 2: trustworthy backtests)
 - Intrabar stops (#18): SL on bar LOW, TP on bar HIGH, SL-first on double

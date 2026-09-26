@@ -15,8 +15,13 @@ Commands:
   strategies            list available strategies + parameters
   price SYM [SYM...]    current prices (public, no key needed)
   candles SYM           recent candles table
+  regime [SYM...]       market-regime diagnosis (bull/bear/chop/volatile)
+  screener              ranked watchlist scan (momentum + regime + volume)
+  funding [SYM...]      futures funding rates + 7d average
   test-connection       ping Binance + verify API keys
   backtest [-d DAYS]    walk-forward backtest on real klines
+  optimize [-d DAYS]    grid-search strategy params (ranks by Sharpe/PnL/Calmar)
+  analyze               journal analytics by symbol + strategy
   run                   start trading loop (paper or live)
   status                portfolio dashboard (positions + equity)
   positions             open positions
@@ -25,6 +30,7 @@ Commands:
   signals [-N]          recent strategy signals
   export-trades FILE    export journal to CSV
   set-mode MODE         paper|live (edits config.yml)
+  set-env ENV           demo|real = testnet|mainnet API (edits config.yml)
 
 Global flags: -c PATH (config), -v (debug logs), --json (machine output),
   --no-color (plain output), --log-file PATH (file logging).
@@ -467,13 +473,17 @@ def cmd_backtest(args) -> int:
         all_rows: list = []
         end_time = None
         first_page = True
+        oldest_seen: int | None = None
         while len(all_rows) < target:
             kl = client.klines(
                 sym, "15m", limit=min(1000, target - len(all_rows)), end_time=end_time
             )
             if not kl:
                 break
-            end_time = kl[0]["open_time"] - 1
+            if oldest_seen is not None and kl[0]["open_time"] >= oldest_seen:
+                break  # no progress (exchange clamped) - avoid infinite loop
+            oldest_seen = kl[0]["open_time"]
+            end_time = oldest_seen - 1
             if first_page:
                 # Newest page ends at the still-forming candle - drop it so the
                 # backtest runs on closed bars only (#11: no look-ahead).
@@ -485,8 +495,8 @@ def cmd_backtest(args) -> int:
                 break  # no progress (degenerate page) - avoid infinite loop
             if not args.json:
                 console.print(f"  {sym}: {len(all_rows)}/{target} candles", end="\r")
-            if len(kl) < min(1000, target):
-                break
+            # NOTE: no short-page break - the API sometimes returns 999/1000
+            # with more history behind it; empty + no-progress breaks suffice.
         k = Klines(all_rows).drop_duplicates_by_time()
         klines[sym] = k
         if not args.json:
@@ -586,6 +596,399 @@ def cmd_backtest(args) -> int:
         bt.export_trades_csv(results, str(Path(args.csv).with_suffix("")) + ".trades.csv")
         if not args.json:
             console.print(f"[green]OK wrote {path}[/green]")
+    return 0
+
+
+def _load_history(cfg, client, days: int, quiet: bool = False):
+    """Shared kline + funding loader (closed bars only, deduped)."""
+    from glmbot.klines import Klines
+
+    klines = {}
+    target = max(60, days * 24 * 4)
+    for sym in cfg.symbols:
+        all_rows: list = []
+        end_time = None
+        first_page = True
+        oldest_seen: int | None = None
+        while len(all_rows) < target:
+            kl = client.klines(sym, "15m", limit=min(1000, target - len(all_rows)), end_time=end_time)
+            if not kl:
+                break
+            if oldest_seen is not None and kl[0]["open_time"] >= oldest_seen:
+                break
+            oldest_seen = kl[0]["open_time"]
+            end_time = oldest_seen - 1
+            if first_page:
+                kl = kl[:-1]
+                first_page = False
+            before = len(all_rows)
+            all_rows = kl + all_rows
+            if len(all_rows) == before:
+                break
+        k = Klines(all_rows).drop_duplicates_by_time()
+        klines[sym] = k
+        if not quiet:
+            console.print(f"  OK {sym}: {len(k)} candles" + " " * 20)
+    funding: dict[str, list] = {}
+    if cfg.market == "futures":
+        for sym, k in klines.items():
+            if not len(k):
+                continue
+            try:
+                funding[sym] = client.funding_history(sym, k.open_time[0], k.open_time[-1])
+            except Exception:
+                funding[sym] = []
+    return klines, funding
+
+
+def _parse_grid_sets(sets: list[str] | None) -> dict[str, list]:
+    """Parse --set KEY=v1,v2 into a param grid (ints/floats auto-typed)."""
+    grid: dict[str, list] = {}
+    for item in sets or []:
+        if "=" not in item or "." not in item.split("=")[0]:
+            raise ValueError(f"bad --set {item!r} (want 'strategy.param=v1,v2')")
+        key, raw_vals = item.split("=", 1)
+        vals = []
+        for v in raw_vals.split(","):
+            v = v.strip()
+            if not v:
+                continue
+            try:
+                vals.append(int(v))
+                continue
+            except ValueError:
+                pass
+            try:
+                vals.append(float(v))
+                continue
+            except ValueError:
+                pass
+            vals.append(v)
+        if not vals:
+            raise ValueError(f"bad --set {item!r} (no values)")
+        grid[key.strip()] = vals
+    return grid
+
+
+def _default_grid(cfg) -> dict[str, list]:
+    """Small sensible grid when the user passes no --set (capped, safe)."""
+    active = list(cfg.strategies)
+    grid: dict[str, list] = {}
+    if "ema_cross" in active:
+        grid["ema_cross.fast"] = [5, 9, 12]
+        grid["ema_cross.slow"] = [21, 26]
+    elif "rsi_reversion" in active:
+        grid["rsi_reversion.period"] = [10, 14, 21]
+        grid["rsi_reversion.oversold"] = [25, 30]
+    elif "macd" in active:
+        grid["macd.fast"] = [8, 12]
+        grid["macd.slow"] = [21, 26]
+    elif active:
+        first = active[0]
+        grid[f"{first}.__note__"] = [0]  # placeholder replaced below
+        grid.pop(f"{first}.__note__")
+        # Generic fallback: vary min_votes-equivalent via risk is not gridable;
+        # instead vary nothing and tell the user. Empty grid errors cleanly.
+    return grid
+
+
+def cmd_optimize(args) -> int:
+    cfg = _load(args)
+    client = _client(cfg)
+    from glmbot.optimize import run_optimization
+
+    try:
+        grid = _parse_grid_sets(args.set)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        return 1
+    if not grid:
+        grid = _default_grid(cfg)
+    if not grid:
+        console.print("[red]no grid: pass --set strategy.param=v1,v2 (e.g. --set ema_cross.fast=5,9,12)[/red]")
+        return 1
+    if not args.json:
+        console.print(f"Loading {args.days}d of 15m candles for {len(cfg.symbols)} symbols...")
+    klines, funding = _load_history(cfg, client, args.days, quiet=bool(args.json))
+    rows = run_optimization(cfg, klines, grid, funding=funding, metric=args.metric,
+                            max_combos=args.max_combos)
+    if args.json:
+        _print_json({"metric": args.metric, "grid": grid, "rows": rows})
+        return 0
+    table = Table(title=f"Optimize (ranked by {args.metric}, {len(rows)} combos)")
+    table.add_column("Rank", justify="right")
+    table.add_column("Params", style="cyan")
+    table.add_column("Trades", justify="right")
+    table.add_column("Win%", justify="right")
+    table.add_column("PnL%", justify="right")
+    table.add_column("Sharpe", justify="right")
+    table.add_column("MaxDD%", justify="right")
+    for i, r in enumerate(rows[:20], 1):
+        table.add_row(str(i), r["label"][:60], str(int(r["trades"])), f"{r['win_rate']:.0f}%",
+                      f"{r['pnl_pct']:+.2f}%", f"{r['sharpe']:.2f}", f"{r['worst_max_dd']:.2f}")
+    console.print(table)
+    if rows:
+        console.print(f"[green]best: {rows[0]['label']}[/] (score {rows[0]['score']:.3f})")
+        console.print("[dim]tip: apply the winner to config.yml, then re-run backtest --folds to confirm[/dim]")
+    return 0
+
+
+def cmd_screener(args) -> int:
+    cfg = _load(args)
+    client = _client(cfg)
+    from glmbot.indicators import adx as adx_fn
+    from glmbot.indicators import atr as atr_fn
+    from glmbot.indicators import rsi as rsi_fn
+    from glmbot.klines import Klines
+    from glmbot.regime import detect_regime
+    from glmbot.strategies import build_strategies
+
+    strats = build_strategies(cfg.strategies, cfg.strategy_params)
+    rows = []
+    syms = args.symbols or cfg.symbols
+    for sym in syms:
+        s = sym.upper()
+        if not s.endswith(cfg.quote_asset):
+            s += cfg.quote_asset
+        try:
+            raw = client.klines(s, "15m", limit=120)
+        except Exception as e:
+            rows.append({"symbol": s, "error": str(e)[:80]})
+            continue
+        k = Klines(raw).closed()
+        if len(k) < 60:
+            rows.append({"symbol": s, "error": f"only {len(k)} closed bars"})
+            continue
+        votes = []
+        for st in strats:
+            try:
+                votes.append(st.evaluate(s, k).side)
+            except Exception:
+                votes.append("HOLD")
+        buys = sum(1 for v in votes if v == "BUY")
+        sells = sum(1 for v in votes if v == "SELL")
+        try:
+            rsi_v = rsi_fn(k.close, 14)[-1]
+        except Exception:
+            rsi_v = None
+        try:
+            adx_v = adx_fn(k.high, k.low, k.close, 14)[0][-1]
+        except Exception:
+            adx_v = None
+        try:
+            atr_v = atr_fn(k.high, k.low, k.close, 14)[-1]
+            atr_pct = (atr_v / k.close[-1] * 100) if atr_v and k.close[-1] else None
+        except Exception:
+            atr_pct = None
+        vol_ratio = None
+        try:
+            if len(k.volume) >= 20 and sum(k.volume[-20:]) > 0:
+                sma20 = sum(k.volume[-20:]) / 20
+                vol_ratio = k.volume[-1] / sma20 if sma20 else None
+        except Exception:
+            pass
+        try:
+            reg = detect_regime(k)
+        except Exception:
+            reg = {"regime": "unknown", "reason": ""}
+        score = (buys - sells) + (1 if reg.get("regime") == "bull" else
+                                  (-2 if reg.get("regime") in ("bear", "volatile") else 0))
+        chg = (k.close[-1] / k.close[0] - 1) * 100 if k.close[0] else 0.0
+        rows.append({"symbol": s, "price": k.close[-1], "chg_pct": chg, "buys": buys,
+                     "sells": sells, "rsi": rsi_v, "adx": adx_v, "atr_pct": atr_pct,
+                     "vol_x": vol_ratio, "regime": reg.get("regime"), "score": score,
+                     "reason": reg.get("reason", "")})
+    rows.sort(key=lambda r: r.get("score", -99), reverse=True)
+    if args.json:
+        _print_json(rows)
+        return 0
+    table = Table(title="Screener (15m closed bars, sorted by score)")
+    for col, just in (("Symbol", "left"), ("Price", "right"), ("Trend%", "right"),
+                      ("B/S", "right"), ("RSI", "right"), ("ADX", "right"),
+                      ("ATR%", "right"), ("Volx", "right"), ("Regime", "left"), ("Score", "right")):
+        table.add_column(col, justify=just)
+    for r in rows:
+        if "error" in r:
+            table.add_row(r["symbol"], "-", "-", "-", "-", "-", "-", "-", r["error"], "-")
+            continue
+        table.add_row(r["symbol"], f"{r['price']:,.6g}", f"{r['chg_pct']:+.1f}%",
+                      f"{r['buys']}/{r['sells']}",
+                      f"{r['rsi']:.0f}" if r["rsi"] is not None else "-",
+                      f"{r['adx']:.0f}" if r["adx"] is not None else "-",
+                      f"{r['atr_pct']:.2f}" if r["atr_pct"] is not None else "-",
+                      f"{r['vol_x']:.1f}x" if r["vol_x"] is not None else "-",
+                      str(r["regime"]), str(r["score"]))
+    console.print(table)
+    console.print("[dim]score = (BUY votes - SELL votes) + regime bonus (bull +1, bear/volatile -2)[/dim]")
+    return 0
+
+
+def cmd_regime(args) -> int:
+    cfg = _load(args)
+    client = _client(cfg)
+    from glmbot.klines import Klines
+    from glmbot.regime import detect_regime
+
+    syms = args.symbols or cfg.symbols
+    rows = []
+    for sym in syms:
+        s = sym.upper()
+        if not s.endswith(cfg.quote_asset):
+            s += cfg.quote_asset
+        try:
+            raw = client.klines(s, "15m", limit=120)
+        except Exception as e:
+            rows.append({"symbol": s, "regime": "unknown", "reason": str(e)[:100]})
+            continue
+        k = Klines(raw).closed()
+        try:
+            info = detect_regime(k)
+        except Exception as e:
+            info = {"regime": "unknown", "reason": str(e)[:100]}
+        rows.append({"symbol": s, **info})
+    if args.json:
+        _print_json(rows)
+        return 0
+    table = Table(title="Market regime (15m closed bars)")
+    for col in ("Symbol", "Regime", "ADX", "ATR%", "Diagnosis"):
+        table.add_column(col)
+    for r in rows:
+        adx_s = f"{r.get('adx')}" if r.get("adx") is not None else "-"
+        atr_s = f"{r.get('atr_pct')}%" if r.get("atr_pct") is not None else "-"
+        table.add_row(r["symbol"], str(r.get("regime", "?")), adx_s, atr_s,
+                      str(r.get("reason", ""))[:60])
+    console.print(table)
+    return 0
+
+
+def cmd_funding(args) -> int:
+    cfg = _load(args)
+    client = _client(cfg)
+    if cfg.market != "futures":
+        msg = "funding is futures-only (config trade_type=spot)"
+        if args.json:
+            _print_json({"ok": False, "error": msg})
+        else:
+            console.print(f"[yellow]{msg}[/yellow]")
+        return 1
+    import time as _time
+
+    syms = args.symbols or cfg.symbols
+    rows = []
+    for sym in syms:
+        s = sym.upper()
+        if not s.endswith(cfg.quote_asset):
+            s += cfg.quote_asset
+        try:
+            now_ms = int(_time.time() * 1000)
+            evts = client.funding_history(s, now_ms - 7 * 86400 * 1000, now_ms)
+        except Exception as e:
+            rows.append({"symbol": s, "error": str(e)[:100]})
+            continue
+        rates = [r for _, r in evts]
+        last = rates[-1] if rates else None
+        avg = (sum(rates) / len(rates)) if rates else None
+        rows.append({"symbol": s, "events_7d": len(rates),
+                     "last_pct": (last * 100 if last is not None else None),
+                     "avg_7d_pct": (avg * 100 if avg is not None else None),
+                     "max_7d_pct": (max(rates) * 100 if rates else None)})
+    if args.json:
+        _print_json(rows)
+        return 0
+    table = Table(title="Funding rates (positive = longs pay shorts)")
+    for col, just in (("Symbol", "left"), ("Events7d", "right"), ("Last%", "right"),
+                      ("Avg7d%", "right"), ("Max7d%", "right")):
+        table.add_column(col, justify=just)
+    def _fmt(x):
+        return f"{x:.4f}" if x is not None else "-"
+
+    for r in rows:
+        if "error" in r:
+            table.add_row(r["symbol"], "-", "-", "-", r["error"][:40])
+            continue
+        table.add_row(r["symbol"], str(r["events_7d"]), _fmt(r["last_pct"]),
+                      _fmt(r["avg_7d_pct"]), _fmt(r["max_7d_pct"]))
+    console.print(table)
+    return 0
+
+
+def cmd_analyze(args) -> int:
+    cfg = _load(args)
+    from glmbot.storage import Store
+
+    store = Store(cfg.sqlite_path)
+    closed = store.closed_positions(cfg.mode, limit=10000)
+    if args.json:
+        from glmbot.report import trades_summary
+
+        by_sym: dict[str, list] = {}
+        by_strat: dict[str, list] = {}
+        for p in closed:
+            by_sym.setdefault(p["symbol"], []).append(p)
+            by_strat.setdefault(p.get("strategy", "?"), []).append(p)
+
+        def _agg(ps):
+            pnls = [float(x.get("pnl_quote") or 0) for x in ps]
+            wins = sum(1 for v in pnls if v > 0)
+            gp = sum(v for v in pnls if v > 0)
+            gl = sum(-v for v in pnls if v < 0)
+            return {"trades": len(ps), "wins": wins,
+                    "win_rate": round(wins / len(ps) * 100, 1) if ps else 0.0,
+                    "pnl": round(sum(pnls), 2),
+                    "profit_factor": round(gp / gl, 2) if gl > 0 else None,
+                    "avg_win": round(gp / wins, 2) if wins else 0.0,
+                    "avg_loss": round(-gl / (len(ps) - wins), 2) if len(ps) - wins else 0.0}
+
+        _print_json({"mode": cfg.mode, "closed": len(closed),
+                     "by_symbol": {k: _agg(v) for k, v in by_sym.items()},
+                     "by_strategy": {k: _agg(v) for k, v in by_strat.items()},
+                     "journal": trades_summary(store.trades(mode=cfg.mode, limit=100000))})
+        return 0
+    if not closed:
+        console.print("[dim]no closed positions yet - run the bot or backtest first[/dim]")
+        return 0
+    pnls = [float(p.get("pnl_quote") or 0) for p in closed]
+    wins = sum(1 for v in pnls if v > 0)
+    gp = sum(v for v in pnls if v > 0)
+    gl = sum(-v for v in pnls if v < 0)
+    pf = (gp / gl) if gl > 0 else float("inf")
+    console.print(f"[bold]Trade analytics ({cfg.mode}, {len(closed)} closed)[/]")
+    console.print(f"Win rate {(wins / len(closed) * 100):.0f}% ({wins}/{len(closed)}) | "
+                  f"PnL {sum(pnls):+.2f} {cfg.quote_asset} | "
+                  f"PF {'inf' if pf == float('inf') else f'{pf:.2f}'}")
+    # by-symbol table
+    table = Table(title="By symbol")
+    for col, just in (("Symbol", "left"), ("N", "right"), ("Win%", "right"),
+                      ("PnL", "right"), ("PF", "right")):
+        table.add_column(col, justify=just)
+    by_sym: dict[str, list] = {}
+    for p in closed:
+        by_sym.setdefault(p["symbol"], []).append(p)
+    for sym in sorted(by_sym, key=lambda s: sum(float(x.get("pnl_quote") or 0) for x in by_sym[s]),
+                      reverse=True)[:15]:
+        ps = by_sym[sym]
+        pp = [float(x.get("pnl_quote") or 0) for x in ps]
+        w = sum(1 for v in pp if v > 0)
+        _gp = sum(v for v in pp if v > 0)
+        _gl = sum(-v for v in pp if v < 0)
+        _pf = (_gp / _gl) if _gl > 0 else float("inf")
+        table.add_row(sym, str(len(ps)), f"{w / len(ps) * 100:.0f}%",
+                      f"{sum(pp):+.2f}", "inf" if _pf == float("inf") else f"{_pf:.2f}")
+    console.print(table)
+    # by-strategy table
+    table2 = Table(title="By strategy")
+    for col, just in (("Strategy", "left"), ("N", "right"), ("Win%", "right"), ("PnL", "right")):
+        table2.add_column(col, justify=just)
+    by_st: dict[str, list] = {}
+    for p in closed:
+        by_st.setdefault(p.get("strategy", "?"), []).append(p)
+    for st in sorted(by_st, key=lambda s: sum(float(x.get("pnl_quote") or 0) for x in by_st[s]),
+                     reverse=True)[:15]:
+        ps = by_st[st]
+        pp = [float(x.get("pnl_quote") or 0) for x in ps]
+        w = sum(1 for v in pp if v > 0)
+        table2.add_row(st, str(len(ps)), f"{w / len(ps) * 100:.0f}%", f"{sum(pp):+.2f}")
+    console.print(table2)
     return 0
 
 
@@ -761,6 +1164,31 @@ def cmd_set_mode(args) -> int:
     return 0
 
 
+def cmd_set_env(args) -> int:
+    """Switch between demo (testnet) and real (mainnet) Binance API."""
+    import re
+
+    p = Path(args.config or "config.yml")
+    if not p.exists():
+        console.print(f"[red]{p} not found[/red]")
+        return 1
+    text = p.read_text(encoding="utf-8")
+    want = "true" if args.env == "demo" else "false"
+    new, n = re.subn(r"(testnet:\s*)(\w+)", rf"\g<1>{want}", text, count=1)
+    if n == 0:
+        console.print("[red]could not find api.testnet in config[/red]")
+        return 1
+    p.write_text(new, encoding="utf-8")
+    if args.env == "real":
+        console.print(
+            "[green]OK env set to REAL (mainnet)[/green]"
+            " - [red bold]real money. Paste mainnet keys, then run `doctor`[/]"
+        )
+    else:
+        console.print("[green]OK env set to DEMO (testnet)[/green] - safe to test, then run `doctor`")
+    return 0
+
+
 # --------------------------------------------------------------------------
 # parser
 # --------------------------------------------------------------------------
@@ -823,6 +1251,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp.set_defaults(fn=cmd_backtest)
 
+    sp = sub.add_parser("optimize", help="grid-search strategy params on real klines")
+    sp.add_argument("-d", "--days", type=int, default=14)
+    sp.add_argument("--metric", default="sharpe",
+                    choices=["sharpe", "pnl", "calmar", "profit_factor", "win_rate"])
+    sp.add_argument("--max-combos", type=int, default=64)
+    sp.add_argument("--set", action="append", default=[],
+                    help="param grid: strategy.param=v1,v2 (repeatable)")
+    sp.set_defaults(fn=cmd_optimize)
+
+    sp = sub.add_parser("screener", help="ranked watchlist scan (momentum + regime)")
+    sp.add_argument("symbols", nargs="*", default=[])
+    sp.set_defaults(fn=cmd_screener)
+
+    sp = sub.add_parser("regime", help="market-regime diagnosis per symbol")
+    sp.add_argument("symbols", nargs="*", default=[])
+    sp.set_defaults(fn=cmd_regime)
+
+    sp = sub.add_parser("funding", help="futures funding rates + 7d average")
+    sp.add_argument("symbols", nargs="*", default=[])
+    sp.set_defaults(fn=cmd_funding)
+
+    sp = sub.add_parser("analyze", help="journal analytics by symbol + strategy")
+    sp.set_defaults(fn=cmd_analyze)
+
     sp = sub.add_parser("run", help="start trading loop")
     sp.add_argument("-y", "--yes", action="store_true", help="skip live confirmation")
     sp.set_defaults(fn=cmd_run)
@@ -853,6 +1305,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("set-mode", help="set paper|live in config")
     sp.add_argument("mode", choices=["paper", "live"])
     sp.set_defaults(fn=cmd_set_mode)
+
+    sp = sub.add_parser("set-env", help="set demo (testnet) | real (mainnet) API")
+    sp.add_argument("env", choices=["demo", "real"])
+    sp.set_defaults(fn=cmd_set_env)
 
     return parser
 

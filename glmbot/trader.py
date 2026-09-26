@@ -149,6 +149,35 @@ class Trader:
             log.warning("ATR calc failed: %s", e)
             return None
 
+    def _market_stats(self, symbol: str, k: Klines | None = None) -> dict:
+        """Volatility / volume / chandelier context for advanced risk filters.
+
+        Returns {atr, atr_pct, volume_ratio, highest_high}. Missing data is
+        None (filters fail open). One kline fetch is reused by the caller.
+        """
+        try:
+            kk = k if k is not None else self._df(symbol)
+        except Exception:
+            return {"atr": None, "atr_pct": None, "volume_ratio": None, "highest_high": None}
+        atr_v = self._atr(kk)
+        price = float(kk.close[-1]) if kk.close else 0.0
+        atr_pct = (atr_v / price * 100.0) if atr_v and price else None
+        volume_ratio = None
+        try:
+            if len(kk.volume) >= 21 and sum(kk.volume[-20:]) > 0:
+                sma20 = sum(kk.volume[-20:]) / 20.0
+                volume_ratio = (kk.volume[-1] / sma20) if sma20 > 0 else None
+        except Exception:
+            volume_ratio = None
+        highest_high = None
+        try:
+            if self.cfg.risk.chandelier_enabled and len(kk.high) >= self.cfg.risk.chandelier_period:
+                highest_high = max(kk.high[-self.cfg.risk.chandelier_period :])
+        except Exception:
+            highest_high = None
+        return {"atr": atr_v, "atr_pct": atr_pct, "volume_ratio": volume_ratio,
+                "highest_high": highest_high, "klines": kk}
+
     def _price(self, symbol: str) -> float:
         kl = self.client.klines(symbol, CANDLE_INTERVAL, limit=2)
         if not kl:
@@ -233,8 +262,15 @@ class Trader:
             price = quotes.get(symbol)
             if price is None:
                 continue
+            ch_high, ch_atr = None, None
+            if self.cfg.risk.chandelier_enabled:
+                try:
+                    ctx = self._market_stats(symbol)
+                    ch_high, ch_atr = ctx["highest_high"], ctx["atr"]
+                except Exception:
+                    ch_high, ch_atr = None, None
             try:
-                plan = self.risk.check_exit(pos, price)
+                plan = self.risk.check_exit(pos, price, ch_high, ch_atr)
             except Exception as e:
                 log.error("exit check failed for %s: %s", symbol, e)
                 stats["errors"] += 1
@@ -260,7 +296,7 @@ class Trader:
         # Catches stops that fired while away and unknown manual positions.
         self._reconcile_cycle(quotes)
 
-        # 2) entries
+        # 2) entries (consensus -> regime filter -> risk gates -> fill)
         halted, why_halt = self.risk.halted(mode)
         if halted:
             log.warning("kill switch active for today - no new entries (%s)", why_halt)
@@ -275,7 +311,27 @@ class Trader:
                     sig = self._consensus(symbol)
                     if sig is None or sig.side != BUY:
                         continue
-                    ok, why = self.risk.can_open(symbol, mode)
+                    ctx = self._market_stats(symbol)
+                    if self.cfg.regime_filter:
+                        try:
+                            from .regime import detect_regime, regime_allows_entries
+
+                            kk = ctx.get("klines")
+                            if kk is None:
+                                kk = self._df(symbol)
+                            info = detect_regime(kk)
+                            ok_reg, why_reg = regime_allows_entries(
+                                info["regime"], self.cfg.regime_allow_chop
+                            )
+                            if not ok_reg:
+                                log.info("skip entry %s: %s", symbol, why_reg)
+                                continue
+                        except Exception as e:
+                            log.debug("regime filter bypassed for %s: %s", symbol, e)
+                    ok, why = self.risk.can_open(
+                        symbol, mode, atr_pct=ctx.get("atr_pct"),
+                        volume_ratio=ctx.get("volume_ratio"),
+                    )
                     if not ok:
                         log.info("skip entry %s: %s", symbol, why)
                         continue
@@ -303,6 +359,12 @@ class Trader:
         if self.risk.check_daily_loss(mode, total):
             self.notifier.kill_switch(
                 f"[{mode.upper()}] DAILY LOSS CAP HIT - trading halted until tomorrow (UTC) "
+                f"(equity {total:.2f} {self.cfg.quote_asset})"
+            )
+        if self.risk.check_daily_profit(mode, total):
+            self.notifier.kill_switch(
+                f"[{mode.upper()}] DAILY PROFIT LOCK +{self.cfg.risk.daily_profit_lock_pct:g}% - "
+                f"banking the green day, no new entries until tomorrow (UTC) "
                 f"(equity {total:.2f} {self.cfg.quote_asset})"
             )
         if self.risk.check_consecutive_losses(mode):

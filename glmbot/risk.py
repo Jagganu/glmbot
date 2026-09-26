@@ -2,7 +2,8 @@
 
 Order of exit checks (first hit wins):
   0. breakeven lock (once trigger reached, SL ratchets to entry + buffer)
-  1. hard stop-loss -> 2. take-profit -> 3. trailing stop -> 4. time stop.
+  1. hard stop-loss -> 2. take-profit -> 3. trailing stop ->
+  3b. chandelier ATR exit (opt-in) -> 4. time stop.
 
 Trailing stop *ratchets*: as price climbs, ``stop_loss`` is raised to
 ``trail_high * (1 - trailing_pct)`` and persisted via ``Store.update_trail``.
@@ -49,9 +50,14 @@ class RiskManager:
 
     # ---------------- entries ----------------
     def halted(self, mode: str) -> tuple[bool, str]:
-        """Any latched halt for today: daily cap, consecutive losses, drawdown."""
+        """Any latched halt for today: daily cap, profit lock, consec losses, drawdown."""
         if self.tripped_today(mode):
             return True, "daily loss cap tripped - trading halted until tomorrow (UTC)"
+        if self._latched(f"profitlock:{mode}"):
+            return True, (
+                f"daily profit lock +{self.cfg.daily_profit_lock_pct:g}% hit - "
+                "new entries halted until tomorrow (UTC)"
+            )
         if self._latched(f"consloss:{mode}"):
             return True, (
                 f"{self.cfg.consecutive_loss_halt} consecutive losses - "
@@ -73,8 +79,19 @@ class RiskManager:
     def _latch(self, stem: str) -> None:
         self.store.set_meta(self._latch_key(stem), "1")
 
-    def can_open(self, symbol: str, mode: str) -> tuple[bool, str]:
-        """Return (allowed, human-readable reason). Empty reason when allowed."""
+    def can_open(
+        self,
+        symbol: str,
+        mode: str,
+        atr_pct: float | None = None,
+        volume_ratio: float | None = None,
+    ) -> tuple[bool, str]:
+        """Return (allowed, human-readable reason). Empty reason when allowed.
+
+        Optional advanced filters (pass None to skip):
+          - ``atr_pct``: 100 * ATR / price (volatility regime guard).
+          - ``volume_ratio``: last volume / SMA20(volume) (participation guard).
+        """
         open_pos = self.store.open_positions(mode)
         if len(open_pos) >= self.cfg.max_open_positions:
             return (
@@ -89,10 +106,37 @@ class RiskManager:
             n_today = self._count_entries_today(mode, today)
             if n_today >= self.cfg.max_daily_trades:
                 return False, f"daily trade budget used ({n_today}/{self.cfg.max_daily_trades})"
+        # Volatility regime filter (skip explosive or dead markets).
+        if atr_pct is not None:
+            try:
+                ap = float(atr_pct)
+                if self.cfg.max_atr_pct > 0 and ap > self.cfg.max_atr_pct:
+                    return False, f"volatility too hot (ATR {ap:.2f}% > cap {self.cfg.max_atr_pct:g}%)"
+                if self.cfg.min_atr_pct > 0 and ap < self.cfg.min_atr_pct:
+                    return False, f"volatility too cold (ATR {ap:.2f}% < floor {self.cfg.min_atr_pct:g}%)"
+            except (TypeError, ValueError):
+                pass
+        # Volume participation filter (skip thin prints).
+        if volume_ratio is not None and self.cfg.volume_filter_mult > 0:
+            try:
+                if float(volume_ratio) < self.cfg.volume_filter_mult:
+                    return False, (
+                        f"thin volume (x{float(volume_ratio):.2f} < "
+                        f"required x{self.cfg.volume_filter_mult:g})"
+                    )
+            except (TypeError, ValueError):
+                pass
         last = self._last_entry_ts.get(symbol)
         if last and time.time() - last < self.cfg.cooldown_min * 60:
             wait = int(self.cfg.cooldown_min - (time.time() - last) / 60) + 1
             return False, f"cooldown: {wait}m left for {symbol} ({self.cfg.cooldown_min}m)"
+        # Post-loss global cooldown (0 = off): after any losing close, force a
+        # breather so revenge-trading streaks can't compound instantly.
+        if self.cfg.cooldown_after_loss_min > 0:
+            age = self._last_loss_age_min(mode)
+            if age is not None and age < self.cfg.cooldown_after_loss_min:
+                wait = int(self.cfg.cooldown_after_loss_min - age) + 1
+                return False, f"post-loss cooldown: {wait}m left ({self.cfg.cooldown_after_loss_min}m)"
         return True, ""
 
     def _count_entries_today(self, mode: str, today: str) -> int:
@@ -148,6 +192,54 @@ class RiskManager:
         if todays:
             return float(todays[0]["total"])
         return float(rows[-1]["total"])
+
+    def check_daily_profit(self, mode: str, current_total: float) -> bool:
+        """Latch a profit-lock halt after +N% vs today's first snapshot.
+
+        Symmetric to the loss cap: bank a green day instead of giving it back.
+        Returns True exactly when the lock *trips on this call*.
+        """
+        cap = self.cfg.daily_profit_lock_pct
+        if cap <= 0 or self._latched(f"profitlock:{mode}"):
+            return False
+        baseline = self._day_baseline(mode)
+        if baseline is None or baseline <= 0:
+            return False
+        gain_pct = (current_total / baseline - 1) * 100
+        if gain_pct >= cap:
+            self._latch(f"profitlock:{mode}")
+            log.warning(
+                "DAILY PROFIT LOCK: +%.2f%% (cap +%.2f%%, baseline %.2f -> now %.2f) "
+                "- halting new entries until tomorrow (UTC)",
+                gain_pct,
+                cap,
+                baseline,
+                current_total,
+            )
+            return True
+        return False
+
+    def _last_loss_age_min(self, mode: str) -> float | None:
+        """Minutes since the most recent losing close, else None."""
+        for pos in self.store.closed_positions(mode):
+            pnl = pos.get("pnl_quote")
+            if pnl is None:
+                continue
+            try:
+                is_loss = float(pnl) < 0
+            except (TypeError, ValueError):
+                continue
+            if not is_loss:
+                return None  # most recent decisive close was a win -> no penalty
+            closed = pos.get("closed_ts")
+            if not closed:
+                return 0.0  # loss with unknown time -> treat as just happened
+            try:
+                dt = datetime.strptime(closed, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                return 0.0
+            return (datetime.now(timezone.utc) - dt).total_seconds() / 60.0
+        return None
 
     # ---------------- stronger kill switches ----------------
     def consecutive_losses(self, mode: str) -> int:
@@ -285,7 +377,18 @@ class RiskManager:
             self._last_entry_ts[symbol] = ts
 
     # ---------------- exits ----------------
-    def check_exit(self, pos: dict, price: float) -> ExitPlan:
+    @staticmethod
+    def chandelier_stop(highest_high: float, atr: float, mult: float = 3.0) -> float:
+        """Chandelier exit level: highest high of the lookback minus N*ATR."""
+        return float(highest_high) - float(mult) * float(atr)
+
+    def check_exit(
+        self,
+        pos: dict,
+        price: float,
+        highest_high: float | None = None,
+        atr: float | None = None,
+    ) -> ExitPlan:
         cfg = self.cfg
         entry = float(pos["entry_price"])
         sl, tp = pos.get("stop_loss"), pos.get("take_profit")
@@ -334,6 +437,17 @@ class RiskManager:
                 return ExitPlan(
                     "exit", f"trailing stop ({price:.6g} <= trail {trail_sl:.6g})", price
                 )
+
+        # 3b. chandelier exit (ATR trailing from highest high, opt-in).
+        if cfg.chandelier_enabled and highest_high and atr and atr > 0:
+            try:
+                ch = self.chandelier_stop(float(highest_high), float(atr), cfg.chandelier_mult)
+                if ch > entry and price <= ch:
+                    return ExitPlan(
+                        "exit", f"chandelier stop ({price:.6g} <= {ch:.6g})", price
+                    )
+            except (TypeError, ValueError):
+                pass
 
         # 4. time stop: exit dead-money positions based on opened_ts age.
         if cfg.max_hold_min > 0:

@@ -1,6 +1,6 @@
 [project]
 name = "glmbot"
-version = "1.5.0"
+version = "2.1.1"
 description = "Professional CLI crypto trading bot for Binance spot and USD-M futures"
 readme = "README.md"
 requires-python = ">=3.10"

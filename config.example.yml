@@ -1,4 +1,4 @@
-# ================= GLMBOT CONFIG v1.4 =================
+# ================= GLMBOT CONFIG v2.0 =================
 # Copy to config.yml and edit. NEVER commit real keys (config.yml is gitignored).
 #
 # Quick start:
@@ -26,11 +26,17 @@ trading:
   # TAKE_PROFIT_MARKET (closePosition) on every entry. They fire on Binance
   # even while the bot is down. Bot-side trailing/signal exits act first.
   exchange_stops: true
+  # Regime filter (opt-in): skip longs in bear/chop/volatile 15m regimes
+  # (glmbot.regime.detect_regime). Off by default -> backward compatible.
+  regime_filter: false
+  regime_allow_chop: false   # true = allow longs in chop (breakout traders only)
 
 strategies:
-  # Available: ema_cross, rsi_reversion, macd, bollinger, supertrend,
+  # Available (18): ema_cross, rsi_reversion, macd, bollinger, supertrend,
   #   donchian_breakout, vwap_trend, stoch_rsi_cross, bollinger_squeeze,
-  #   trend_momentum. Run `py bot.py strategies` for signal logic + parameters.
+  #   trend_momentum, adx_trend, ichimoku_trend, keltner_breakout, obv_trend,
+  #   mfi_reversion, tema_trend, stoch_cross, cci_reversion.
+  # Run `py bot.py strategies` for signal logic + parameters.
   # NOTE: changing `active` changes vote math (risk.min_votes) - backtest first.
   active: ["ema_cross", "rsi_reversion", "macd", "bollinger"]
   ema_cross:
@@ -67,6 +73,36 @@ strategies:
   #   fast: 20
   #   slow: 50
   #   rsi_period: 14
+  # adx_trend:                 # +DI/-DI cross with ADX strength floor
+  #   period: 14
+  #   adx_min: 20.0
+  # ichimoku_trend:            # TK cross + price vs cloud (no forward shift)
+  #   tenkan: 9
+  #   kijun: 26
+  #   senkou_b: 52
+  # keltner_breakout:          # close cross outside EMA +/- ATR envelope
+  #   ema_period: 20
+  #   atr_period: 10
+  #   multiplier: 2.0
+  # obv_trend:                 # smart-money flow (OBV EMA cross)
+  #   fast: 9
+  #   slow: 21
+  # mfi_reversion:             # volume-weighted RSI extremes
+  #   period: 14
+  #   oversold: 20
+  #   overbought: 80
+  # tema_trend:                # low-lag triple-EMA cross
+  #   fast: 9
+  #   slow: 21
+  # stoch_cross:               # classic %K/%D ignition in extremes
+  #   k_period: 14
+  #   d_period: 3
+  #   oversold: 20
+  #   overbought: 80
+  # cci_reversion:             # snap-back from +/-100
+  #   period: 20
+  #   oversold: -100
+  #   overbought: 100
 
 risk:
   quote_budget: 1000.0         # total quote allocated to the bot (sizing anchor)
@@ -101,6 +137,15 @@ risk:
   max_symbol_positions: 1      # reserved (v1 = 1 position per symbol)
   slippage_bps: 0.0            # backtest slippage in basis points (e.g. 5 = 0.05%)
   stop_slippage_bps: 0.0       # extra adverse slippage on stop fills (fast markets)
+  # --- v2 advanced guards (all opt-in, 0/false = off -> backward compatible) ---
+  daily_profit_lock_pct: 0.0   # halt entries after +N% day (bank the green day)
+  chandelier_enabled: false    # ATR chandelier exit (highest high - mult*ATR)
+  chandelier_period: 22
+  chandelier_mult: 3.0
+  max_atr_pct: 0.0             # skip entries when ATR/price*100 > cap (explosive)
+  min_atr_pct: 0.0             # skip entries when ATR/price*100 < floor (dead market)
+  volume_filter_mult: 0.0      # require last vol >= SMA20 * mult (e.g. 1.2)
+  cooldown_after_loss_min: 0   # global breather after any losing close (e.g. 60)
 
 watchlist:
   symbols: ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"]

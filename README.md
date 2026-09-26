@@ -8,9 +8,12 @@ for color.
 ┌────────────────────────────────────────────────────────────────┐
 │  bot.py validate         →  config check (no network)           │
 │  bot.py doctor            →  env + connectivity diagnostics      │
+│  bot.py screener          →  ranked momentum + regime scan       │
 │  bot.py backtest -d 7     →  strategy validation on real klines  │
+│  bot.py optimize -d 14    →  grid-search params (Sharpe-ranked)  │
 │  bot.py run               →  trading loop (paper / live)         │
 │  bot.py status            →  portfolio dashboard                 │
+│  bot.py analyze           →  journal PnL by symbol + strategy    │
 └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -20,17 +23,28 @@ for color.
   (leverage 1–20x, one-way mode, reduceOnly closes). Futures *testnet* has a
   broken price feed, so the bot reads decisions from **real mainnet data**
   while orders execute on testnet (hybrid mode, automatic).
-- **10 strategies, vote consensus** — `ema_cross`, `rsi_reversion`, `macd`,
+- **18 strategies, vote consensus** — `ema_cross`, `rsi_reversion`, `macd`,
   `bollinger`, `supertrend`, `donchian_breakout`, `vwap_trend`,
-  `stoch_rsi_cross`, `bollinger_squeeze`, `trend_momentum`. `risk.min_votes: 0` =
+  `stoch_rsi_cross`, `bollinger_squeeze`, `trend_momentum`, `adx_trend`,
+  `ichimoku_trend`, `keltner_breakout`, `obv_trend`, `mfi_reversion`,
+  `tema_trend`, `stoch_cross`, `cci_reversion`. `risk.min_votes: 0` =
   unanimous, `N` = at-least-N-of-M with SELL veto. See `bot.py strategies`.
+- **Regime engine** — bull/bear/chop/volatile from EMA + ADX + ATR%
+  (`bot.py regime`); optional live long filter (`trading.regime_filter`).
+- **Optimizer + screener** — `bot.py optimize --set ema_cross.fast=5,9,12
+  --metric sharpe` grid-searches the faithful backtester; `bot.py screener`
+  ranks the watchlist by votes + regime + volume; `bot.py funding` shows 7d
+  funding costs; `bot.py analyze` breaks journal PnL down by symbol/strategy.
 - **Risk-first engine** — % budget sizing, max positions, per-symbol cooldown,
-  fixed-% or ATR stops, breakeven lock, ratcheting trailing stop, time stop,
-  daily-loss kill switch, opt-in daily trade budget. Exits checked *before*
-  entries every cycle.
+  fixed-% or ATR stops, breakeven lock, ratcheting trailing stop, chandelier
+  ATR exit (opt-in), time stop, daily-loss kill switch + daily profit lock,
+  volatility/volume entry filters, post-loss cooldown, opt-in daily trade
+  budget. Exits checked *before* entries every cycle.
 - **Faithful backtester** — same strategy + risk code as live, 1-bar execution
-  delay, fees + configurable slippage, ATR/min-votes support, Sharpe/Sortino/
-  profit-factor/expectancy/exposure/buy-and-hold metrics, CSV export.
+  delay, fees + configurable slippage, ATR/chandelier/volatility/volume/
+  min-votes support, Sharpe/Sortino/Calmar/ulcer/VaR-CVaR/recovery/
+  profit-factor/expectancy/exposure/buy-and-hold metrics, CSV export,
+  walk-forward folds, ablation, grid optimizer.
 - **SQLite journal** — trades, positions, equity curve, signals, kill-switch
   state. Survives restarts (positions + cooldowns restored). CSV export.
 - **Alerts** — Telegram (HTML-escaped, throttled) + generic webhook
@@ -76,11 +90,17 @@ Or `bash setup.sh` (universal) / `bash setup-termux.sh` (Android), or
 | `candles SYM [-n N] [-r ROWS] [-i 15m]` | candle table |
 | `test-connection` | ping + signed-request + wallet |
 | `backtest [-d DAYS] [--csv FILE]` | walk-forward backtest (+ CSV export) |
+| `optimize [-d DAYS] [--set k=v,..] [--metric sharpe]` | grid-search params, ranked |
+| `screener [SYM…]` | ranked momentum + regime + volume scan |
+| `regime [SYM…]` | bull/bear/chop/volatile diagnosis |
+| `funding [SYM…]` | futures funding rates + 7d avg |
+| `analyze` | journal PnL by symbol + strategy |
 | `run [-y]` | trading loop (preflight + heartbeat) |
 | `status` | dashboard: equity, day PnL, kill switch, positions |
 | `positions` / `trades [-N]` / `equity` / `signals [-N]` | journal views |
 | `export-trades FILE [--all-modes]` | journal → CSV |
 | `set-mode paper\|live` | switch mode in config.yml |
+| `set-env demo\|real` | switch testnet (demo) ↔ mainnet (real) API |
 
 Global flags: `-c PATH` config (or `GLMBOT_CONFIG`), `-v` debug,
 `--json` machine output (most commands), `--no-color`, `--log-file PATH`.
@@ -165,6 +185,14 @@ risk:
   atr_sl_mult: 2.0
   atr_tp_mult: 3.0
   daily_loss_cap_pct: 5.0   # kill switch: halt entries after -5% day (0 = off)
+  daily_profit_lock_pct: 0.0 # profit lock: halt entries after +N% day (0 = off)
+  chandelier_enabled: false # ATR chandelier exit (highest high - mult*ATR)
+  chandelier_period: 22
+  chandelier_mult: 3.0
+  max_atr_pct: 0.0          # skip entries when ATR% above cap (0 = off)
+  min_atr_pct: 0.0          # skip entries when ATR% below floor (0 = off)
+  volume_filter_mult: 0.0   # require last vol >= SMA20 x mult (0 = off)
+  cooldown_after_loss_min: 0 # global breather after a losing close (0 = off)
   min_votes: 0              # 0 = unanimous; N = at-least-N-of-M
   max_daily_trades: 0       # 0 = unlimited
   slippage_bps: 0.0         # backtest slippage (e.g. 5 = 0.05%)
@@ -175,6 +203,8 @@ trading:
   exchange_stops: true    # live futures: attach STOP_MARKET + TAKE_PROFIT_MARKET
                           # (closePosition) on every entry - they fire on Binance
                           # even while the bot is down; bot-side exits act first
+  regime_filter: false    # skip longs in bear/chop/volatile 15m regimes
+  regime_allow_chop: false # true = allow longs in chop (breakout traders only)
 ```
 
 **Leverage warning**: at 10x, a 2% adverse move ≈ 20% of margin. Start 1–2x,
@@ -215,6 +245,10 @@ config: `bot.py validate --json`. Secrets are never printed (masked repr).
 python bot.py backtest -d 30 --csv backtest.csv
 python bot.py backtest -d 30 --folds 4        # walk-forward across regimes
 python bot.py backtest -d 14 --ablate         # keep only strategies with edge
+python bot.py optimize -d 14 --set ema_cross.fast=5,9,12 --set ema_cross.slow=21,26 --metric sharpe
+python bot.py screener                         # ranked entry candidates now
+python bot.py regime btc eth                   # bull/bear/chop per symbol
+python bot.py analyze                           # what actually made money?
 ```
 
 - Real 15m klines paginated from the data market (same source as live).
@@ -228,8 +262,9 @@ python bot.py backtest -d 14 --ablate         # keep only strategies with edge
 - **Ablation** (`--ablate`): full set vs minus-one vs single runs with
   keep/drop verdicts per strategy.
 - Metrics: trades, win rate, PnL%, MaxDD, profit factor, expectancy,
-  avg win/loss, Sharpe/Sortino (15m-annualized), exposure%, buy-and-hold
-  delta, fees, funding. Portfolio panel rolls up independent per-symbol runs.
+  avg win/loss, Sharpe/Sortino/Calmar (15m-annualized), ulcer, VaR-95/CVaR-95,
+  recovery, exposure%, buy-and-hold delta, fees, funding. Portfolio panel rolls
+  up independent per-symbol runs.
 - `--csv` writes summary + `.trades.csv` (per-fill audit trail).
 
 Limitations (be honest with yourself): no liquidation modeling, no
@@ -287,9 +322,10 @@ make lint | make typecheck
 ```
 
 Architecture: `api.py` (REST) → `klines.py`/`indicators.py` →
-`strategies.py` → `trader.py` (+ `risk.py`) → `broker.py` →
+`strategies.py` (18) → `regime.py` → `trader.py` (+ `risk.py`) → `broker.py` →
 `storage.py`/`notifier.py` → `report.py`/`ui.py`. `bot.py` is CLI only.
-`backtest.py` reuses strategy + risk semantics with its own fill model.
+`backtest.py` reuses strategy + risk semantics with its own fill model;
+`optimize.py` grid-searches it; `metrics.py` scores everything.
 CI runs lint + tests on 3.10–3.12.
 
 ## Disclaimer

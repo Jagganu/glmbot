@@ -54,11 +54,11 @@ CREATE TABLE IF NOT EXISTS positions (
     mode TEXT NOT NULL DEFAULT 'paper',
     stop_order_id TEXT,
     take_order_id TEXT,
-    exchange_stop_price REAL,
-    UNIQUE(symbol, mode, status)
+    exchange_stop_price REAL
 );
 CREATE INDEX IF NOT EXISTS idx_pos_symbol ON positions(symbol, status);
 CREATE INDEX IF NOT EXISTS idx_pos_mode_status ON positions(mode, status);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_pos_open ON positions(symbol, mode) WHERE status='open';
 CREATE TABLE IF NOT EXISTS equity (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT NOT NULL,
@@ -115,6 +115,55 @@ class Store:
                     c.execute(f"ALTER TABLE positions ADD COLUMN {coldef}")
             except sqlite3.DatabaseError:
                 pass  # column already present
+        self._migrate_position_uniqueness()
+
+    def _migrate_position_uniqueness(self) -> None:
+        """Replace table-level UNIQUE(symbol, mode, status) with a partial index.
+
+        The old constraint wrongly blocked the 2nd-ever close of a symbol
+        (two 'closed' rows collide) - journal closes then fail with
+        IntegrityError and ghost positions can never reconcile. One open
+        position per symbol+mode is still enforced, now only for status='open'.
+        """
+        try:
+            with self._conn() as c:
+                row = c.execute(
+                    "SELECT sql FROM sqlite_master WHERE name='positions'"
+                ).fetchone()
+                if not row or "UNIQUE(symbol, mode, status)" not in (row["sql"] or ""):
+                    c.execute(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS uq_pos_open "
+                        "ON positions(symbol, mode) WHERE status='open'"
+                    )
+                    return
+                info = list(c.execute("PRAGMA table_info(positions)"))
+                defs = []
+                for col in info:
+                    d = f"{col['name']} {col['type']}"
+                    if col["pk"]:
+                        d += " PRIMARY KEY" + (" AUTOINCREMENT" if col["name"] == "id" else "")
+                    if col["notnull"]:
+                        d += " NOT NULL"
+                    if col["dflt_value"] is not None:
+                        d += f" DEFAULT {col['dflt_value']}"
+                    defs.append(d)
+                names = ", ".join(col["name"] for col in info)
+                c.execute("ALTER TABLE positions RENAME TO positions_legacy")
+                c.execute(f"CREATE TABLE positions ({', '.join(defs)})")
+                c.execute(f"INSERT INTO positions ({names}) SELECT {names} FROM positions_legacy")
+                c.execute("DROP TABLE positions_legacy")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_pos_symbol ON positions(symbol, status)")
+                c.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_pos_mode_status ON positions(mode, status)"
+                )
+                c.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_pos_open "
+                    "ON positions(symbol, mode) WHERE status='open'"
+                )
+        except sqlite3.DatabaseError as e:
+            import logging
+
+            logging.getLogger("glmbot.storage").warning("position uniqueness migration: %s", e)
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:

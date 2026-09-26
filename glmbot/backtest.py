@@ -80,6 +80,11 @@ class BTResult:
     avg_loss: float = 0.0
     sharpe: float = 0.0
     sortino: float = 0.0
+    calmar: float = 0.0
+    ulcer: float = 0.0
+    var_95_pct: float = 0.0
+    cvar_95_pct: float = 0.0
+    recovery: float = 0.0
     exposure_pct: float = 0.0
     buy_hold_pct: float = 0.0
     total_funding: float = 0.0  # signed net paid (>0 = cost) while in position
@@ -105,6 +110,11 @@ class BTResult:
             "expectancy": round(self.expectancy, 2),
             "sharpe_15m": round(self.sharpe, 2),
             "sortino_15m": round(self.sortino, 2),
+            "calmar": round(self.calmar, 2),
+            "ulcer": round(self.ulcer, 2),
+            "var_95_pct": round(self.var_95_pct, 2),
+            "cvar_95_pct": round(self.cvar_95_pct, 2),
+            "recovery": round(self.recovery, 2),
             "exposure_pct": round(self.exposure_pct, 1),
             "buy_hold_pct": round(self.buy_hold_pct, 2),
             "final_equity": round(self.final_equity, 2),
@@ -195,9 +205,15 @@ class Backtester:
         buy_hold = (closes[-1] / closes[0] - 1) * 100 if closes[0] else 0.0
         res.buy_hold_pct = buy_hold
 
-        # Precompute ATR series once (used only when atr_stops enabled).
+        # Precompute ATR series once (ATR stops, chandelier, volatility filter).
         atr_s: list[float | None] = [None] * n
-        if self.risk_cfg.atr_stops:
+        need_atr = (
+            self.risk_cfg.atr_stops
+            or self.risk_cfg.chandelier_enabled
+            or self.risk_cfg.max_atr_pct > 0
+            or self.risk_cfg.min_atr_pct > 0
+        )
+        if need_atr:
             try:
                 atr_s = atr_fn(k.high, k.low, k.close, self.risk_cfg.atr_period)
             except Exception:
@@ -309,6 +325,19 @@ class Backtester:
                     if stop_loss is not None and trail_high > entry_price and bar_low <= trail_sl:
                         exit_reason = "trailing-stop"
                         exit_ref = min(close, trail_sl)
+                if exit_reason is None and self.risk_cfg.chandelier_enabled:
+                    try:
+                        cp = self.risk_cfg.chandelier_period
+                        lo = max(0, i - cp + 1)
+                        hh = max(float(x) for x in k.high[lo : i + 1])
+                        av = atr_s[i]
+                        if av and av > 0:
+                            ch = hh - self.risk_cfg.chandelier_mult * float(av)
+                            if ch > entry_price and bar_low <= ch:
+                                exit_reason = "chandelier-stop"
+                                exit_ref = min(close, ch)
+                    except Exception:
+                        pass
                 if (
                     exit_reason is None
                     and self.risk_cfg.max_hold_min > 0
@@ -352,6 +381,8 @@ class Backtester:
                         res.total_funding += pay
 
             # ---- look for entry signal (fills NEXT bar) ----
+            # Advanced entry filters mirror the live trader: volatility regime
+            # (ATR%) and volume participation must pass before arming a fill.
             if qty == 0 and pending_entry is None:
                 votes = self._votes(symbol, window)
                 buys = [v for v in votes if v.side == BUY]
@@ -360,7 +391,26 @@ class Backtester:
                 need = self.risk_cfg.min_votes if self.risk_cfg.min_votes > 0 else m
                 need = min(max(need, 1), m)
                 if len(buys) >= need and len(sells) == 0:
-                    pending_entry = {"reason": buys[0].reason}
+                    allow = True
+                    if self.risk_cfg.max_atr_pct > 0 or self.risk_cfg.min_atr_pct > 0:
+                        av = atr_s[i]
+                        if av and close:
+                            ap = float(av) / close * 100.0
+                            if self.risk_cfg.max_atr_pct > 0 and ap > self.risk_cfg.max_atr_pct:
+                                allow = False
+                            if self.risk_cfg.min_atr_pct > 0 and ap < self.risk_cfg.min_atr_pct:
+                                allow = False
+                    if allow and self.risk_cfg.volume_filter_mult > 0:
+                        try:
+                            vols = k.volume[max(0, i - 19) : i + 1]
+                            if len(vols) >= 20 and sum(vols[:-1]) > 0:
+                                sma20 = sum(vols) / len(vols)
+                                if sma20 > 0 and vols[-1] / sma20 < self.risk_cfg.volume_filter_mult:
+                                    allow = False
+                        except Exception:
+                            pass
+                    if allow:
+                        pending_entry = {"reason": buys[0].reason}
 
             if self.is_futures and qty > 0:
                 # margin + unrealized (same honest accounting as the live trader)
@@ -428,8 +478,38 @@ class Backtester:
             need = max(need, int(p.get("donchian_breakout", {}).get("period", 20)) + 2)
         if "supertrend" in active:
             need = max(need, int(p.get("supertrend", {}).get("period", 10)) + 3)
+        if "adx_trend" in active:
+            need = max(need, 2 * int(p.get("adx_trend", {}).get("period", 14)) + 2)
+        if "ichimoku_trend" in active:
+            need = max(need, int(p.get("ichimoku_trend", {}).get("senkou_b", 52)) + 2)
+        if "keltner_breakout" in active:
+            need = max(
+                need,
+                max(
+                    int(p.get("keltner_breakout", {}).get("ema_period", 20)),
+                    int(p.get("keltner_breakout", {}).get("atr_period", 10)),
+                )
+                + 3,
+            )
+        if "obv_trend" in active:
+            need = max(need, int(p.get("obv_trend", {}).get("slow", 21)) + 2)
+        if "mfi_reversion" in active:
+            need = max(need, int(p.get("mfi_reversion", {}).get("period", 14)) + 2)
+        if "tema_trend" in active:
+            need = max(need, 3 * int(p.get("tema_trend", {}).get("slow", 21)) + 2)
+        if "stoch_cross" in active:
+            need = max(
+                need,
+                int(p.get("stoch_cross", {}).get("k_period", 14))
+                + int(p.get("stoch_cross", {}).get("d_period", 3))
+                + 1,
+            )
+        if "cci_reversion" in active:
+            need = max(need, int(p.get("cci_reversion", {}).get("period", 20)) + 2)
         if self.risk_cfg.atr_stops:
             need = max(need, self.risk_cfg.atr_period + 2)
+        if self.risk_cfg.chandelier_enabled:
+            need = max(need, self.risk_cfg.chandelier_period + self.risk_cfg.atr_period + 2)
         return need
 
     def _votes(self, symbol: str, window: Klines) -> list[Signal]:
@@ -531,9 +611,32 @@ class Backtester:
 
         res.expectancy = exp_fn(res.win_rate, res.avg_win, res.avg_loss)
         if res.equity_curve:
+            from .metrics import calmar_ratio as calmar_fn
+            from .metrics import recovery_factor as rec_fn
+            from .metrics import tail_risk as tail_fn
+            from .metrics import ulcer_index as ulcer_fn
+
             res.max_drawdown_pct = md_fn(res.equity_curve)
             res.sharpe = sharpe_ratio(res.equity_curve)
             res.sortino = sortino_ratio(res.equity_curve)
+            try:
+                res.calmar = calmar_fn(res.equity_curve)
+            except Exception:
+                res.calmar = 0.0
+            try:
+                res.ulcer = ulcer_fn(res.equity_curve)
+            except Exception:
+                res.ulcer = 0.0
+            try:
+                tail = tail_fn(res.equity_curve)
+                res.var_95_pct = tail["var_95_pct"]
+                res.cvar_95_pct = tail["cvar_95_pct"]
+            except Exception:
+                res.var_95_pct = res.cvar_95_pct = 0.0
+            try:
+                res.recovery = rec_fn(res.equity_curve)
+            except Exception:
+                res.recovery = 0.0
         res.exposure_pct = (bars_in_pos / total_bars * 100) if total_bars > 0 else 0.0
 
 

@@ -77,3 +77,72 @@ def expectancy(win_rate_pct: float, avg_win: float, avg_loss: float) -> float:
     """Expected value per trade in quote currency."""
     p = win_rate_pct / 100.0
     return p * avg_win - (1 - p) * abs(avg_loss)
+
+
+def annualized_return(curve: Sequence[float], periods_per_year: float = 35_040.0) -> float:
+    """CAGR from an equity curve (15m bars by default). Returns a ratio, not %."""
+    c = _clean(curve)
+    if len(c) < 2 or c[0] <= 0:
+        return 0.0
+    try:
+        total = c[-1] / c[0]
+        if total <= 0:
+            return -1.0
+        years = (len(c) - 1) / periods_per_year
+        if years <= 0:
+            return total - 1.0
+        return total ** (1.0 / years) - 1.0
+    except (OverflowError, ValueError, ZeroDivisionError):
+        return 0.0
+
+
+def calmar_ratio(curve: Sequence[float], periods_per_year: float = 35_040.0) -> float:
+    """Annualized return / max-drawdown (0 when flat or no drawdown info)."""
+    dd = max_drawdown(curve)
+    if dd <= 0:
+        return 0.0
+    ann = annualized_return(curve, periods_per_year)
+    return ann / (dd / 100.0)
+
+
+def ulcer_index(curve: Sequence[float]) -> float:
+    """Ulcer index: RMS of drawdown % (pain index, lower = smoother)."""
+    c = _clean(curve)
+    if len(c) < 2:
+        return 0.0
+    peak = c[0]
+    sq = 0.0
+    for x in c:
+        peak = max(peak, x)
+        dd = (peak - x) / peak * 100.0 if peak > 0 else 0.0
+        sq += dd * dd
+    return (sq / len(c)) ** 0.5
+
+
+def tail_risk(curve: Sequence[float]) -> dict[str, float]:
+    """Historical VaR-95 / CVaR-95 of per-step returns (as positive % losses)."""
+    rets = returns_from_equity(curve)
+    if len(rets) < 10:
+        return {"var_95_pct": 0.0, "cvar_95_pct": 0.0}
+    ordered = sorted(rets)
+    idx = max(0, int(len(ordered) * 0.05) - 1)
+    var = -ordered[idx] * 100.0
+    tail = ordered[: idx + 1]
+    cvar = -(sum(tail) / len(tail)) * 100.0 if tail else 0.0
+    return {"var_95_pct": max(0.0, var), "cvar_95_pct": max(0.0, cvar)}
+
+
+def recovery_factor(curve: Sequence[float]) -> float:
+    """Net profit / max-drawdown amount (0 when flat or no drawdown)."""
+    c = _clean(curve)
+    if len(c) < 2:
+        return 0.0
+    profit = c[-1] - c[0]
+    if profit <= 0:
+        return 0.0
+    dd_pct = max_drawdown(c)
+    if dd_pct <= 0:
+        return 0.0
+    peak = max(c)
+    dd_amt = peak * dd_pct / 100.0
+    return profit / dd_amt if dd_amt > 0 else 0.0
