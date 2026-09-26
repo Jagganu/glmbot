@@ -52,8 +52,14 @@ def detect_regime(
     except Exception:
         atr_v = None
     if f[-1] is None or s[-1] is None:
-        return {"regime": "unknown", "adx": None, "trend": 0, "atr_pct": None,
-                "reason": "indicator warmup", "price": price}
+        return {
+            "regime": "unknown",
+            "adx": None,
+            "trend": 0,
+            "atr_pct": None,
+            "reason": "indicator warmup",
+            "price": price,
+        }
     adx_v = float(a[-1]) if a[-1] is not None else 0.0
     atr_pct = (float(atr_v) / price * 100.0) if atr_v and price else 0.0
     up = f[-1] > s[-1]  # type: ignore[operator]

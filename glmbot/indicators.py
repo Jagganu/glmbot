@@ -579,7 +579,6 @@ def ichimoku(
             sa[i] = (t[i] + k[i]) / 2  # type: ignore[operator]
         if i >= senkou_b_period - 1:
             sb[i] = (
-                max(h[i - senkou_b_period + 1 : i + 1])
-                + min(lo[i - senkou_b_period + 1 : i + 1])
+                max(h[i - senkou_b_period + 1 : i + 1]) + min(lo[i - senkou_b_period + 1 : i + 1])
             ) / 2
     return t, k, sa, sb

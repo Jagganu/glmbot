@@ -538,15 +538,25 @@ class ADXTrend(Strategy):
         if len(k) < 2 * self.period + 2:
             return Signal(HOLD, "insufficient history", symbol, price, self.name)
         a, pdi, mdi = adx(k.high, k.low, k.close, self.period)
-        if a[-1] is None or pdi[-2] is None or mdi[-2] is None or pdi[-1] is None or mdi[-1] is None:
+        if (
+            a[-1] is None
+            or pdi[-2] is None
+            or mdi[-2] is None
+            or pdi[-1] is None
+            or mdi[-1] is None
+        ):
             return Signal(HOLD, "adx warmup", symbol, price, self.name)
         prev_diff = pdi[-2] - mdi[-2]  # type: ignore[operator]
         curr_diff = pdi[-1] - mdi[-1]  # type: ignore[operator]
         strength = float(a[-1])
         if prev_diff <= 0 < curr_diff and strength >= self.adx_min:
-            return Signal(BUY, f"+DI crossed above -DI (ADX {strength:.1f})", symbol, price, self.name)
+            return Signal(
+                BUY, f"+DI crossed above -DI (ADX {strength:.1f})", symbol, price, self.name
+            )
         if prev_diff >= 0 > curr_diff:
-            return Signal(SELL, f"-DI crossed above +DI (ADX {strength:.1f})", symbol, price, self.name)
+            return Signal(
+                SELL, f"-DI crossed above +DI (ADX {strength:.1f})", symbol, price, self.name
+            )
         return Signal(HOLD, f"ADX {strength:.1f}", symbol, price, self.name)
 
 
@@ -593,7 +603,9 @@ class IchimokuTrend(Strategy):
             reason = "TK cross down" if cross_dn else f"price below cloud ({cloud_bot:.6g})"
             return Signal(SELL, reason, symbol, price, self.name)
         above = price > cloud_top
-        return Signal(HOLD, f"price {'above' if above else 'inside/below'} cloud", symbol, price, self.name)
+        return Signal(
+            HOLD, f"price {'above' if above else 'inside/below'} cloud", symbol, price, self.name
+        )
 
 
 class KeltnerBreakout(Strategy):
@@ -624,14 +636,18 @@ class KeltnerBreakout(Strategy):
         price = float(k.close[-1]) if k.close else 0.0
         if len(k) < max(self.ema_period, self.atr_period) + 3:
             return Signal(HOLD, "insufficient history", symbol, price, self.name)
-        upper, _mid, lower = keltner(k.high, k.low, k.close, self.ema_period, self.atr_period, self.mult)
+        upper, _mid, lower = keltner(
+            k.high, k.low, k.close, self.ema_period, self.atr_period, self.mult
+        )
         if upper[-2] is None or lower[-2] is None or upper[-1] is None or lower[-1] is None:
             return Signal(HOLD, "keltner warmup", symbol, price, self.name)
         prev_c = float(k.close[-2])
         if prev_c <= float(upper[-2]) and price > float(upper[-1]):
             return Signal(BUY, f"breakout above Keltner {upper[-1]:.6g}", symbol, price, self.name)
         if prev_c >= float(lower[-2]) and price < float(lower[-1]):
-            return Signal(SELL, f"breakdown below Keltner {lower[-1]:.6g}", symbol, price, self.name)
+            return Signal(
+                SELL, f"breakdown below Keltner {lower[-1]:.6g}", symbol, price, self.name
+            )
         return Signal(HOLD, "inside Keltner channel", symbol, price, self.name)
 
 
@@ -709,9 +725,13 @@ class MFIReversion(Strategy):
         if prev is None or cur is None:
             return Signal(HOLD, "mfi warmup", symbol, price, self.name)
         if prev <= self.os < cur:
-            return Signal(BUY, f"MFI recovered above {self.os:g} ({cur:.1f})", symbol, price, self.name)
+            return Signal(
+                BUY, f"MFI recovered above {self.os:g} ({cur:.1f})", symbol, price, self.name
+            )
         if prev >= self.ob > cur:
-            return Signal(SELL, f"MFI dropped below {self.ob:g} ({cur:.1f})", symbol, price, self.name)
+            return Signal(
+                SELL, f"MFI dropped below {self.ob:g} ({cur:.1f})", symbol, price, self.name
+            )
         return Signal(HOLD, f"MFI {cur:.1f}", symbol, price, self.name)
 
 
@@ -749,9 +769,13 @@ class TEMATrend(Strategy):
         prev_diff = f[-2] - s[-2]  # type: ignore[operator]
         curr_diff = f[-1] - s[-1]  # type: ignore[operator]
         if prev_diff <= 0 < curr_diff:
-            return Signal(BUY, f"TEMA{self.fast} crossed above TEMA{self.slow}", symbol, price, self.name)
+            return Signal(
+                BUY, f"TEMA{self.fast} crossed above TEMA{self.slow}", symbol, price, self.name
+            )
         if prev_diff >= 0 > curr_diff:
-            return Signal(SELL, f"TEMA{self.fast} crossed below TEMA{self.slow}", symbol, price, self.name)
+            return Signal(
+                SELL, f"TEMA{self.fast} crossed below TEMA{self.slow}", symbol, price, self.name
+            )
         return Signal(HOLD, "no TEMA cross", symbol, price, self.name)
 
 
@@ -829,9 +853,13 @@ class CCIReversion(Strategy):
         if prev is None or cur is None:
             return Signal(HOLD, "cci warmup", symbol, price, self.name)
         if prev <= self.os < cur:
-            return Signal(BUY, f"CCI recovered above {self.os:g} ({cur:.1f})", symbol, price, self.name)
+            return Signal(
+                BUY, f"CCI recovered above {self.os:g} ({cur:.1f})", symbol, price, self.name
+            )
         if prev >= self.ob > cur:
-            return Signal(SELL, f"CCI dropped below {self.ob:g} ({cur:.1f})", symbol, price, self.name)
+            return Signal(
+                SELL, f"CCI dropped below {self.ob:g} ({cur:.1f})", symbol, price, self.name
+            )
         return Signal(HOLD, f"CCI {cur:.1f}", symbol, price, self.name)
 
 

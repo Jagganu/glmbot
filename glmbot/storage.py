@@ -127,9 +127,7 @@ class Store:
         """
         try:
             with self._conn() as c:
-                row = c.execute(
-                    "SELECT sql FROM sqlite_master WHERE name='positions'"
-                ).fetchone()
+                row = c.execute("SELECT sql FROM sqlite_master WHERE name='positions'").fetchone()
                 if not row or "UNIQUE(symbol, mode, status)" not in (row["sql"] or ""):
                     c.execute(
                         "CREATE UNIQUE INDEX IF NOT EXISTS uq_pos_open "

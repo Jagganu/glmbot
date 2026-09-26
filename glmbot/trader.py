@@ -175,8 +175,13 @@ class Trader:
                 highest_high = max(kk.high[-self.cfg.risk.chandelier_period :])
         except Exception:
             highest_high = None
-        return {"atr": atr_v, "atr_pct": atr_pct, "volume_ratio": volume_ratio,
-                "highest_high": highest_high, "klines": kk}
+        return {
+            "atr": atr_v,
+            "atr_pct": atr_pct,
+            "volume_ratio": volume_ratio,
+            "highest_high": highest_high,
+            "klines": kk,
+        }
 
     def _price(self, symbol: str) -> float:
         kl = self.client.klines(symbol, CANDLE_INTERVAL, limit=2)
@@ -329,7 +334,9 @@ class Trader:
                         except Exception as e:
                             log.debug("regime filter bypassed for %s: %s", symbol, e)
                     ok, why = self.risk.can_open(
-                        symbol, mode, atr_pct=ctx.get("atr_pct"),
+                        symbol,
+                        mode,
+                        atr_pct=ctx.get("atr_pct"),
                         volume_ratio=ctx.get("volume_ratio"),
                     )
                     if not ok:

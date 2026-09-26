@@ -111,9 +111,15 @@ class RiskManager:
             try:
                 ap = float(atr_pct)
                 if self.cfg.max_atr_pct > 0 and ap > self.cfg.max_atr_pct:
-                    return False, f"volatility too hot (ATR {ap:.2f}% > cap {self.cfg.max_atr_pct:g}%)"
+                    return (
+                        False,
+                        f"volatility too hot (ATR {ap:.2f}% > cap {self.cfg.max_atr_pct:g}%)",
+                    )
                 if self.cfg.min_atr_pct > 0 and ap < self.cfg.min_atr_pct:
-                    return False, f"volatility too cold (ATR {ap:.2f}% < floor {self.cfg.min_atr_pct:g}%)"
+                    return (
+                        False,
+                        f"volatility too cold (ATR {ap:.2f}% < floor {self.cfg.min_atr_pct:g}%)",
+                    )
             except (TypeError, ValueError):
                 pass
         # Volume participation filter (skip thin prints).
@@ -136,7 +142,10 @@ class RiskManager:
             age = self._last_loss_age_min(mode)
             if age is not None and age < self.cfg.cooldown_after_loss_min:
                 wait = int(self.cfg.cooldown_after_loss_min - age) + 1
-                return False, f"post-loss cooldown: {wait}m left ({self.cfg.cooldown_after_loss_min}m)"
+                return (
+                    False,
+                    f"post-loss cooldown: {wait}m left ({self.cfg.cooldown_after_loss_min}m)",
+                )
         return True, ""
 
     def _count_entries_today(self, mode: str, today: str) -> int:
@@ -443,9 +452,7 @@ class RiskManager:
             try:
                 ch = self.chandelier_stop(float(highest_high), float(atr), cfg.chandelier_mult)
                 if ch > entry and price <= ch:
-                    return ExitPlan(
-                        "exit", f"chandelier stop ({price:.6g} <= {ch:.6g})", price
-                    )
+                    return ExitPlan("exit", f"chandelier stop ({price:.6g} <= {ch:.6g})", price)
             except (TypeError, ValueError):
                 pass
 

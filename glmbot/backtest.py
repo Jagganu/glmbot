@@ -405,7 +405,10 @@ class Backtester:
                             vols = k.volume[max(0, i - 19) : i + 1]
                             if len(vols) >= 20 and sum(vols[:-1]) > 0:
                                 sma20 = sum(vols) / len(vols)
-                                if sma20 > 0 and vols[-1] / sma20 < self.risk_cfg.volume_filter_mult:
+                                if (
+                                    sma20 > 0
+                                    and vols[-1] / sma20 < self.risk_cfg.volume_filter_mult
+                                ):
                                     allow = False
                         except Exception:
                             pass
